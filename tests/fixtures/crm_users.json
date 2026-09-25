@@ -1,0 +1,21 @@
+{
+  "ivan.petrov@example.com": [
+    {
+      "user_id": "crm-user-1",
+      "first_name": "Ivan",
+      "last_name": "Petrov"
+    }
+  ],
+  "duplicate@example.com": [
+    {
+      "user_id": "crm-user-10",
+      "first_name": "Alex",
+      "last_name": "Smirnov"
+    },
+    {
+      "user_id": "crm-user-11",
+      "first_name": "Alex",
+      "last_name": "Smirnova"
+    }
+  ]
+}

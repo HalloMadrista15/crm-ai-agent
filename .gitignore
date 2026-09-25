@@ -1,0 +1,37 @@
+# Secrets and local environment
+.env
+*.local.env
+info.env
+.auth/
+*.postman_collection.json
+*.postman_environment.json
+
+# SQLite databases and journals
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+
+# Playwright artifacts (traces, screenshots, videos) — never commit CRM PII
+test-results/
+playwright-report/
+**/artifacts/*.png
+**/artifacts/*.webm
+**/artifacts/*.zip
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

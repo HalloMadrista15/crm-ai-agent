@@ -1,0 +1,25 @@
+{
+  "ticket_id": "t-1001",
+  "status": "in_progress",
+  "title": "Please update my last name in CRM",
+  "captured_at": "2026-09-01T10:00:00+00:00",
+  "trusted_fields": {
+    "assignee": "operator1",
+    "priority": "normal",
+    "requester_email": "ivan.petrov@example.com"
+  },
+  "fragments": [
+    {
+      "section": "description",
+      "source_reference": "ticket:EXT-1001#description",
+      "trust_level": "requester_text",
+      "text": "Hi, my last name changed after marriage. Please update it to Ivanova in the system."
+    },
+    {
+      "section": "workflow",
+      "source_reference": "ticket:EXT-1001#approval_status",
+      "trust_level": "crm_workflow_approval",
+      "text": "Approval status: Approved by HR (case #HR-4471)"
+    }
+  ]
+}

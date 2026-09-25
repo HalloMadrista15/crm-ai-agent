@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crm-ai-agent"
+version = "0.1.0"
+description = "Human-in-the-loop AI agent for CRM/Webitel ticket processing"
+requires-python = ">=3.11"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.unittest]
+# No external test runner is required yet: `python -m unittest discover -s
+# tests/unit` works against the src/ layout because ./tests conftest is not
+# needed — see README.md for the exact command (it sets PYTHONPATH=src).
