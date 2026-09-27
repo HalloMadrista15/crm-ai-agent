@@ -96,19 +96,44 @@ class TestCrmSessionManager(unittest.TestCase):
         self.mgr._page = None
         self.assertFalse(self.mgr.is_logged_in())
 
-    def test_is_logged_in_false_when_metadata_request_rejected(self) -> None:
-        # Still on the login form (or session not yet valid): the
-        # authenticated OData endpoint doesn't return 200.
-        self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/Login/NuiLogin.aspx?ReturnUrl=%2f", evaluate_result=302)
+    def test_is_logged_in_false_when_data_query_rejected(self) -> None:
+        # Off the login URL, but the real OData query doesn't return 200.
+        self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/0/Nui/ViewModule.aspx", evaluate_result=302)
         self.assertFalse(self.mgr.is_logged_in())
 
-    def test_is_logged_in_true_when_metadata_request_succeeds(self) -> None:
-        # Session cookies are valid even if the SPA's own URL hasn't
-        # finished updating yet — this is exactly the lag that made the
-        # old page.url-based check unreliable (see is_logged_in's
-        # docstring).
-        self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/Login/NuiLogin.aspx?ReturnUrl=%2f", evaluate_result=200)
+    def test_is_logged_in_true_when_off_login_url_and_data_query_succeeds(self) -> None:
+        self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/0/Nui/ViewModule.aspx#HomePage", evaluate_result=200)
         self.assertTrue(self.mgr.is_logged_in())
+
+    def test_is_logged_in_false_while_still_on_login_url_even_if_data_query_succeeds(self) -> None:
+        """Real bug confirmed 2026-09-28: this CRM sets valid session
+        cookies as soon as username/password are accepted, before MFA is
+        confirmed — so the OData query alone returned 200 while the human
+        was still staring at the MFA code prompt on /Login/NuiLogin.aspx.
+        The URL must have actually left /Login/ too."""
+
+        self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/Login/NuiLogin.aspx?ReturnUrl=%2f", evaluate_result=200)
+        self.assertFalse(self.mgr.is_logged_in())
+
+    def test_is_logged_in_never_checks_metadata_endpoint(self) -> None:
+        """Regression guard: $metadata turned out to be servable without
+        auth (confirmed 2026-09-28 — it kept saying "logged in" while the
+        real browser was still stuck on an MFA prompt), so the check must
+        never rely on it again."""
+
+        captured_scripts: list[str] = []
+
+        class _CapturingPage(_FakePage):
+            def evaluate(self, script: str, arg: object = None) -> object:
+                captured_scripts.append(script)
+                return 200
+
+        self.mgr._page = _CapturingPage(url="https://crm.astana-motors.kz/")
+        self.mgr.is_logged_in()
+
+        (script,) = captured_scripts
+        self.assertNotIn("fetch('/0/odata/$metadata'", script)
+        self.assertIn("BnzVwApproval", script)
 
     def test_is_logged_in_false_when_evaluate_raises(self) -> None:
         class _RaisingPage(_FakePage):

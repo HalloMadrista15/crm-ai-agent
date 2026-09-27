@@ -84,11 +84,18 @@ class WebitelApiActions:
         self._session = session
 
     @classmethod
-    def from_info_env(cls, info_env_path: Path, storage_state_path: Path) -> "WebitelApiActions":
+    def from_info_env(cls, info_env_path: Path, storage_state_path: Path, *, city: str = "almaty") -> "WebitelApiActions":
+        """``city`` selects which ``WEBITEL_<CITY>_BASE_URL`` key to read
+        (e.g. "almaty" -> WEBITEL_ALMATY_BASE_URL, "astana" ->
+        WEBITEL_ASTANA_BASE_URL — confirmed 2026-09-27 for a second real
+        instance). Defaults to "almaty" to match every caller that existed
+        before multi-city support."""
+
         env = _load_env_file(info_env_path)
-        base_url = env.get("WEBITEL_ALMATY_BASE_URL")
+        key = f"WEBITEL_{city.upper()}_BASE_URL"
+        base_url = env.get(key)
         if not base_url:
-            raise ValueError(f"Missing WEBITEL_ALMATY_BASE_URL in {info_env_path}")
+            raise ValueError(f"Missing {key} in {info_env_path}")
         return cls(base_url=base_url, session=load_session(storage_state_path))
 
     def _get(self, path: str) -> Any:

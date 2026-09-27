@@ -30,7 +30,49 @@ from crm_ai_agent.webapp.crm_session import CrmSessionManager
 
 ROOT = Path(__file__).resolve().parents[3]
 INFO_ENV_PATH = ROOT / "info.env"
-WEBITEL_STORAGE_STATE_PATH = ROOT / ".auth" / "webitel_almaty_storage_state.json"
+WEBITEL_STORAGE_STATE_PATHS = {
+    "almaty": ROOT / ".auth" / "webitel_almaty_storage_state.json",
+    "astana": ROOT / ".auth" / "webitel_astana_storage_state.json",
+}
+
+
+_SETTINGS_KEYS = (
+    "CRM_LOGIN",
+    "CRM_PASSWORD",
+    "CRM_VISA_OWNER_ID",
+    "WEBITEL_LOGIN",
+    "WEBITEL_PASSWORD",
+    "WEBITEL_ASTANA_LOGIN",
+    "WEBITEL_ASTANA_PASSWORD",
+)
+
+
+def _save_env_updates(path: Path, updates: dict[str, str]) -> None:
+    """Read-modify-write: only overwrites keys with a non-empty new value,
+    so leaving a field blank in the settings form keeps whatever is
+    already saved (never blanks out a working credential by accident).
+    Shared infra config (base URLs, domains) isn't touched here — those
+    stay in info.env, edited by whoever first sets this up, same for
+    everyone; only the per-operator keys in _SETTINGS_KEYS are writable
+    from this endpoint."""
+
+    existing = _load_env_file(path)
+    for key, value in updates.items():
+        if key not in _SETTINGS_KEYS:
+            continue
+        if value:
+            existing[key] = value
+    lines = [f"{k}={v}" for k, v in existing.items()]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _get_webitel_actions(city: str) -> Any:
+    from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
+
+    storage_state_path = WEBITEL_STORAGE_STATE_PATHS.get(city)
+    if storage_state_path is None:
+        raise ValueError(f"Unknown city {city!r} — must be one of: {', '.join(WEBITEL_STORAGE_STATE_PATHS)}")
+    return WebitelApiActions.from_info_env(INFO_ENV_PATH, storage_state_path, city=city)
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -69,64 +111,73 @@ _INDEX_HTML = """<!doctype html>
 <title>Консоль оператора</title>
 <style>
   :root{
-    --bg:#f7f7f8; --surface:#ffffff; --surface-2:#f7f7f8; --border:#e6e6e9;
-    --text:#1c1c1f; --text-soft:#68686f; --text-faint:#9d9da3;
-    --accent:#1c1c1f; --accent-dark:#000000; --accent-soft:#f0f0f1; --accent-ink:#ffffff;
-    --good:#158548; --good-soft:#e5f6ec; --warn:#b45309; --warn-soft:#fdf1e0;
-    --danger:#c0392b; --danger-dark:#a53024; --danger-soft:#fbe9e7;
-    --shadow:0 1px 2px rgba(20,20,25,.03), 0 6px 16px -8px rgba(20,20,25,.06);
+    --surface:#11162a; --surface-2:#161c36; --border:#262d4d;
+    --text:#eef0f8; --text-soft:#a3aac4; --text-faint:#6b7291;
+    --accent:#ffffff; --accent-dark:#dde1ee; --accent-soft:#1d2444; --accent-ink:#0a0e1a;
+    --good:#3ddc84; --good-soft:#123524; --warn:#f5b64d; --warn-soft:#3a2b10;
+    --danger:#ff6b6b; --danger-dark:#ff8787; --danger-soft:#3a1620;
+    --shadow:0 1px 2px rgba(0,0,0,.2), 0 8px 24px -12px rgba(0,0,0,.5);
     --radius:14px;
   }
   *{box-sizing:border-box;}
   html{-webkit-font-smoothing:antialiased;}
   body{
     font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
-    background:var(--bg);color:var(--text);margin:0;padding:32px 24px 64px;font-size:14px;line-height:1.5;
+    background:linear-gradient(180deg,#0d1526 0%,#152449 40%,#1e3566 100%) fixed;
+    color:var(--text);margin:0;padding:0 0 64px;font-size:14px;line-height:1.5;min-height:100vh;
   }
-  .page{max-width:760px;margin:0 auto;}
-  header.top{margin-bottom:28px;}
-  header.top h1{font-size:21px;font-weight:650;margin:0 0 6px;letter-spacing:-.01em;}
-  header.top .sub{color:var(--text-soft);font-size:13px;max-width:56ch;}
+  .page{max-width:760px;margin:0 auto;padding:24px 24px 0;}
+  .topnav{position:sticky;top:0;z-index:10;background:rgba(5,6,15,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border);}
+  .topnav-inner{max-width:760px;margin:0 auto;padding:0 24px;display:flex;align-items:center;gap:28px;height:56px;}
+  .topnav-brand{font-weight:700;font-size:15px;color:var(--text);letter-spacing:-.01em;flex-shrink:0;}
+  .topnav-links{display:flex;gap:4px;flex:1;}
+  .nav-link{background:transparent;color:var(--text-soft);font-weight:600;font-size:13.5px;padding:8px 14px;border-radius:7px;}
+  .nav-link:hover{background:var(--surface-2);color:var(--text);}
+  .nav-link.active{background:var(--surface-2);color:var(--text);}
+  .nav-account-btn{background:transparent;border:1px solid var(--border);color:var(--text);font-weight:600;font-size:13px;padding:7px 14px;}
+  .nav-account-btn:hover{background:var(--surface-2);}
+  .nav-account-btn.active{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);}
+  .top-sub{color:var(--text-soft);font-size:13px;max-width:56ch;margin-bottom:24px;}
   .steps{display:flex;flex-direction:column;gap:16px;}
   .card{
     background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
     padding:20px 22px;box-shadow:var(--shadow);
   }
   .card-head{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
-  .step-badge{
-    display:flex;align-items:center;justify-content:center;flex-shrink:0;
-    width:24px;height:24px;border-radius:50%;background:var(--accent-soft);color:var(--accent-dark);
-    font-size:12px;font-weight:700;
-  }
-  .card-head h2{font-size:14.5px;font-weight:600;margin:0;color:var(--text);letter-spacing:0;text-transform:none;}
-  .card-body{padding-left:34px;}
+  .card-head h2{font-size:15.5px;font-weight:600;margin:0;color:var(--text);letter-spacing:0;text-transform:none;}
+  .card-body{padding-left:0;}
   label.field-label{display:block;font-size:12px;font-weight:600;color:var(--text-soft);margin:0 0 5px;}
   .row{display:flex;gap:10px;align-items:flex-end;margin-bottom:12px;flex-wrap:wrap;}
   .row:last-child{margin-bottom:0;}
   .field-group{display:flex;flex-direction:column;flex:1;min-width:200px;}
   .field-group.narrow{flex:none;min-width:64px;width:64px;}
-  input[type=text]{
+  input[type=text],input[type=password]{
     padding:9px 11px;border:1px solid var(--border);border-radius:8px;font:inherit;
-    background:var(--surface);color:var(--text);transition:border-color .12s,box-shadow .12s;
+    background:var(--surface-2);color:var(--text);transition:border-color .12s,box-shadow .12s;
   }
-  input[type=text]::placeholder{color:var(--text-faint);}
-  input[type=text]:focus{outline:none;border-color:var(--text-soft);box-shadow:0 0 0 3px rgba(28,28,31,.07);}
+  input[type=text]::placeholder,input[type=password]::placeholder{color:var(--text-faint);}
+  input[type=text]:focus,input[type=password]:focus{outline:none;border-color:var(--text-soft);box-shadow:0 0 0 3px rgba(255,255,255,.06);}
   textarea{
     padding:9px 11px;border:1px solid var(--border);border-radius:8px;font:inherit;resize:vertical;
-    background:var(--surface);color:var(--text);transition:border-color .12s,box-shadow .12s;
+    background:var(--surface-2);color:var(--text);transition:border-color .12s,box-shadow .12s;
   }
   textarea::placeholder{color:var(--text-faint);font-style:italic;}
-  textarea:focus{outline:none;border-color:var(--text-soft);box-shadow:0 0 0 3px rgba(28,28,31,.07);}
+  textarea:focus{outline:none;border-color:var(--text-soft);box-shadow:0 0 0 3px rgba(255,255,255,.06);}
   .subsection{padding:14px 16px;background:var(--surface-2);border:1px solid var(--border);border-radius:10px;margin-bottom:14px;}
   .subsection:last-of-type{margin-bottom:0;}
   .subsection-title{font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-faint);margin-bottom:12px;}
+  .city-picker{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px;}
+  .city-picker-label{font-size:12.5px;font-weight:600;color:var(--text-soft);}
+  .city-tabs{margin-bottom:0;}
   .tabs{display:flex;gap:4px;background:var(--surface-2);border:1px solid var(--border);border-radius:9px;padding:3px;margin-bottom:16px;width:fit-content;}
-  .tab-btn{background:transparent;color:var(--text-soft);font-weight:600;font-size:13px;padding:6px 14px;border-radius:7px;}
-  .tab-btn:hover{background:transparent;color:var(--text);}
-  .tab-btn.active{background:var(--surface);color:var(--text);box-shadow:0 1px 2px rgba(20,20,25,.08);}
-  .tab-btn.active:hover{background:var(--surface);}
+  .tab-btn,.city-btn{background:transparent;color:var(--text-soft);font-weight:600;font-size:13px;padding:6px 14px;border-radius:7px;}
+  .tab-btn:hover,.city-btn:hover{background:transparent;color:var(--text);}
+  .tab-btn.active{background:var(--border);color:var(--text);}
+  .tab-btn.active:hover{background:var(--border);}
+  .city-btn.active{background:var(--accent);color:var(--accent-ink);box-shadow:0 1px 2px rgba(0,0,0,.3);}
+  .city-btn.active:hover{background:var(--accent);color:var(--accent-ink);}
   .hint{font-size:12px;color:var(--text-faint);margin-top:6px;}
-  code{background:var(--accent-soft);border-radius:4px;padding:1px 5px;font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
+  code{background:var(--accent-soft);color:var(--text);border-radius:4px;padding:1px 5px;font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
   .checkbox-row{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-soft);margin-bottom:12px;cursor:pointer;user-select:none;}
   .checkbox-row input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;}
   .list .field.list-error{background:var(--danger-soft);border-color:var(--danger-soft);}
@@ -139,10 +190,10 @@ _INDEX_HTML = """<!doctype html>
   button:hover{background:var(--accent-dark);}
   button:active{transform:translateY(1px);}
   button:disabled{background:var(--border);color:var(--text-faint);cursor:not-allowed;transform:none;}
-  button.danger{background:var(--danger);}
+  button.danger{background:var(--danger);color:#2b0a0a;}
   button.danger:hover{background:var(--danger-dark);}
-  button.ghost{background:transparent;color:var(--accent-dark);border:1px solid var(--border);padding:6px 12px;font-size:12.5px;}
-  button.ghost:hover{background:var(--accent-soft);border-color:var(--accent-soft);}
+  button.ghost{background:transparent;color:var(--text);border:1px solid var(--border);padding:6px 12px;font-size:12.5px;}
+  button.ghost:hover{background:var(--surface-2);border-color:var(--text-soft);}
   .pill{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:700;padding:4px 10px;border-radius:100px;letter-spacing:.01em;}
   .pill.good{background:var(--good-soft);color:var(--good);}
   .pill.warn{background:var(--warn-soft);color:var(--warn);}
@@ -152,11 +203,11 @@ _INDEX_HTML = """<!doctype html>
   .field{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px;}
   .field:last-child{border-bottom:none;}
   .field .k{color:var(--text-soft);flex-shrink:0;}
-  .field .v{font-weight:600;text-align:right;}
+  .field .v{font-weight:600;text-align:right;color:var(--text);}
   .list{display:flex;flex-direction:column;gap:6px;margin-top:10px;}
   .list .field{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:9px 12px;align-items:center;}
   .list .field .k{font-weight:500;color:var(--text);}
-  pre{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:11px 13px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;}
+  pre{background:var(--surface-2);border:1px solid var(--border);border-radius:8px;padding:11px 13px;font-size:12px;overflow-x:auto;white-space:pre-wrap;word-break:break-word;color:var(--text);}
   .msg{font-size:12.5px;margin-top:10px;color:var(--text-soft);}
   .msg:empty{margin-top:0;}
   .msg.error{color:var(--danger-dark);}
@@ -165,16 +216,81 @@ _INDEX_HTML = """<!doctype html>
 </style>
 </head>
 <body>
+<nav class="topnav">
+  <div class="topnav-inner">
+    <span class="topnav-brand">Консоль оператора</span>
+    <div class="topnav-links">
+      <button type="button" class="nav-link active" data-section="ticket">Заявка</button>
+      <button type="button" class="nav-link" data-section="copy">Копировать</button>
+      <button type="button" class="nav-link" data-section="create">Создать</button>
+      <button type="button" class="nav-link" data-section="delete">Удалить</button>
+    </div>
+    <button type="button" class="nav-account-btn" data-section="account">Вход и настройки</button>
+  </div>
+</nav>
 <div class="page">
-  <header class="top">
-    <h1>Консоль оператора</h1>
-    <div class="sub">Локальный инструмент. Только на этом компьютере. Каждое реальное изменение требует отдельного подтверждения.</div>
-  </header>
+  <div class="sub top-sub">Локальный инструмент. Только на этом компьютере. Каждое реальное изменение требует отдельного подтверждения.</div>
 
+  <div class="city-picker" id="cityPicker">
+    <span class="city-picker-label">Город:</span>
+    <div class="tabs city-tabs">
+      <button type="button" class="city-btn active" data-city="almaty">Алматы</button>
+      <button type="button" class="city-btn" data-city="astana">Астана</button>
+    </div>
+  </div>
+
+  <section class="app-section" data-section-panel="account" hidden>
   <div class="steps">
 
   <div class="card">
-    <div class="card-head"><span class="step-badge">1</span><h2>Вход в CRM</h2></div>
+    <div class="card-head"><h2>Настройки — свои учётные данные</h2></div>
+    <div class="card-body">
+      <div class="hint" style="margin:0 0 14px;">Каждый оператор вписывает сюда свои личные логины/пароли (не общие). Пустое поле — оставить как есть, не перезаписывать.</div>
+      <div class="row">
+        <div class="field-group">
+          <label class="field-label" for="settingsCrmLogin">CRM логин</label>
+          <input type="text" id="settingsCrmLogin" placeholder="Логин" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="settingsCrmPassword">CRM пароль</label>
+          <input type="password" id="settingsCrmPassword" placeholder="••••••••" autocomplete="off">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field-group">
+          <label class="field-label" for="settingsCrmVisaOwnerId">CRM Visa Owner ID (для списка заявок)</label>
+          <input type="text" id="settingsCrmVisaOwnerId" placeholder="см. README — как найти" autocomplete="off">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field-group">
+          <label class="field-label" for="settingsWebitelAlmatyLogin">Webitel Алматы — логин</label>
+          <input type="text" id="settingsWebitelAlmatyLogin" placeholder="Логин" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="settingsWebitelAlmatyPassword">Webitel Алматы — пароль</label>
+          <input type="password" id="settingsWebitelAlmatyPassword" placeholder="••••••••" autocomplete="off">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field-group">
+          <label class="field-label" for="settingsWebitelAstanaLogin">Webitel Астана — логин</label>
+          <input type="text" id="settingsWebitelAstanaLogin" placeholder="Логин" autocomplete="off">
+        </div>
+        <div class="field-group">
+          <label class="field-label" for="settingsWebitelAstanaPassword">Webitel Астана — пароль</label>
+          <input type="password" id="settingsWebitelAstanaPassword" placeholder="••••••••" autocomplete="off">
+        </div>
+      </div>
+      <div class="row">
+        <button id="btnSettingsSave">Сохранить</button>
+      </div>
+      <div id="settingsMsg" class="msg info"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-head"><h2>Вход в CRM</h2></div>
     <div class="card-body">
       <div class="row">
         <button id="btnLogin">Войти в CRM</button>
@@ -184,8 +300,14 @@ _INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  </div>
+  </section>
+
+  <section class="app-section" data-section-panel="ticket">
+  <div class="steps">
+
   <div class="card">
-    <div class="card-head"><span class="step-badge">2</span><h2>Заявка</h2></div>
+    <div class="card-head"><h2>Заявка</h2></div>
     <div class="card-body">
       <div class="row">
         <button id="btnPendingTickets" class="ghost">Обновить список ожидающих</button>
@@ -204,8 +326,14 @@ _INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  </div>
+  </section>
+
+  <section class="app-section" data-section-panel="copy" hidden>
+  <div class="steps">
+
   <div class="card">
-    <div class="card-head"><span class="step-badge">3</span><h2>Webitel: копирование ролей/лицензии/группы по образцу</h2></div>
+    <div class="card-head"><h2>Webitel: копирование ролей/лицензии/группы по образцу</h2></div>
     <div class="card-body">
       <div class="row">
         <div class="field-group">
@@ -231,8 +359,14 @@ _INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  </div>
+  </section>
+
+  <section class="app-section" data-section-panel="create" hidden>
+  <div class="steps">
+
   <div class="card">
-    <div class="card-head"><span class="step-badge">4</span><h2>Webitel: создание нового пользователя</h2></div>
+    <div class="card-head"><h2>Webitel: создание нового пользователя</h2></div>
     <div class="card-body">
 
       <div class="tabs">
@@ -311,8 +445,14 @@ _INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  </div>
+  </section>
+
+  <section class="app-section" data-section-panel="delete" hidden>
+  <div class="steps">
+
   <div class="card">
-    <div class="card-head"><span class="step-badge">5</span><h2>Webitel: удаление пользователей</h2></div>
+    <div class="card-head"><h2>Webitel: удаление пользователей</h2></div>
     <div class="card-body">
       <div class="row">
         <div class="field-group">
@@ -331,6 +471,8 @@ _INDEX_HTML = """<!doctype html>
   </div>
 
   </div>
+  </section>
+
 </div>
 
 <script>
@@ -344,6 +486,64 @@ async function api(path, body) {
   if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
+
+const navButtons = document.querySelectorAll('.nav-link, .nav-account-btn');
+const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete'];
+
+navButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    navButtons.forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const target = btn.dataset.section;
+    document.querySelectorAll('.app-section').forEach(panel => {
+      panel.hidden = panel.dataset.sectionPanel !== target;
+    });
+    document.getElementById('cityPicker').hidden = !CITY_PICKER_SECTIONS.includes(target);
+  });
+});
+
+document.getElementById('cityPicker').hidden = !CITY_PICKER_SECTIONS.includes('ticket');
+
+let selectedCity = 'almaty';
+
+document.querySelectorAll('.city-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.city-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedCity = btn.dataset.city;
+  });
+});
+
+document.getElementById('btnSettingsSave').addEventListener('click', async () => {
+  const msgEl = document.getElementById('settingsMsg');
+  const btn = document.getElementById('btnSettingsSave');
+  const payload = {
+    crm_login: document.getElementById('settingsCrmLogin').value.trim(),
+    crm_password: document.getElementById('settingsCrmPassword').value,
+    crm_visa_owner_id: document.getElementById('settingsCrmVisaOwnerId').value.trim(),
+    webitel_almaty_login: document.getElementById('settingsWebitelAlmatyLogin').value.trim(),
+    webitel_almaty_password: document.getElementById('settingsWebitelAlmatyPassword').value,
+    webitel_astana_login: document.getElementById('settingsWebitelAstanaLogin').value.trim(),
+    webitel_astana_password: document.getElementById('settingsWebitelAstanaPassword').value,
+  };
+  btn.disabled = true;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Сохраняю...';
+  try {
+    await api('/api/settings/save', payload);
+    msgEl.className = 'msg info';
+    msgEl.textContent = 'Сохранено. Пустые поля не тронуты — старые значения остались.';
+    // Clear password fields from the DOM after saving so they do not linger visible.
+    document.getElementById('settingsCrmPassword').value = '';
+    document.getElementById('settingsWebitelAlmatyPassword').value = '';
+    document.getElementById('settingsWebitelAstanaPassword').value = '';
+  } catch (e) {
+    msgEl.textContent = 'Ошибка: ' + e.message;
+    msgEl.className = 'msg error';
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 const loginStatusEl = document.getElementById('loginStatus');
 const loginMsgEl = document.getElementById('loginMsg');
@@ -465,7 +665,7 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
 
   for (const target_extension of targets) {
     try {
-      const plan = await api('/api/webitel/plan', {template_extension, target_extension});
+      const plan = await api('/api/webitel/plan', {template_extension, target_extension, city: selectedCity});
       currentPlans.push({ok: true, plan});
     } catch (e) {
       currentPlans.push({ok: false, target: target_extension, error: e.message});
@@ -538,7 +738,7 @@ document.getElementById('btnDeletePlan').addEventListener('click', async () => {
 
   for (const extension of extensions) {
     try {
-      const plan = await api('/api/webitel/delete_plan', {extension});
+      const plan = await api('/api/webitel/delete_plan', {extension, city: selectedCity});
       currentDeletePlans.push({ok: true, plan});
     } catch (e) {
       currentDeletePlans.push({ok: false, extension, error: e.message});
@@ -615,7 +815,7 @@ document.getElementById('btnCreatePlanSingle').addEventListener('click', async (
   msgEl.className = 'msg info';
   msgEl.textContent = 'Строю план (только чтение)...';
   try {
-    const plan = await api('/api/webitel/create_plan', {template_extension, new_username, new_name, new_extension});
+    const plan = await api('/api/webitel/create_plan', {template_extension, new_username, new_name, new_extension, city: selectedCity});
     currentCreatePlanSingle = plan;
     msgEl.textContent = '';
     const roleNames = plan.roles.map(r => r.name).join(', ') || '—';
@@ -671,7 +871,7 @@ document.getElementById('btnNeighbors').addEventListener('click', async () => {
   msgEl.className = 'msg info';
   msgEl.textContent = 'Ищу соседние номера (только чтение)...';
   try {
-    const data = await api('/api/webitel/neighbors', {extension, radius});
+    const data = await api('/api/webitel/neighbors', {extension, radius, city: selectedCity});
     if (data.neighbors.length === 0) {
       msgEl.textContent = 'Соседних номеров не найдено — выберите образец вручную ниже.';
       return;
@@ -732,7 +932,7 @@ document.getElementById('btnCreatePlan').addEventListener('click', async () => {
   for (const entry of entries) {
     try {
       const plan = await api('/api/webitel/create_plan', {
-        template_extension, new_username: entry.login, new_name: entry.name, new_extension: entry.login,
+        template_extension, new_username: entry.login, new_name: entry.name, new_extension: entry.login, city: selectedCity,
       });
       currentCreatePlans.push({ok: true, plan});
     } catch (e) {
@@ -845,6 +1045,25 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
+            if self.path == "/api/settings/save":
+                global _crm_session
+                updates = {
+                    "CRM_LOGIN": body.get("crm_login", "").strip(),
+                    "CRM_PASSWORD": body.get("crm_password", "").strip(),
+                    "CRM_VISA_OWNER_ID": body.get("crm_visa_owner_id", "").strip(),
+                    "WEBITEL_LOGIN": body.get("webitel_almaty_login", "").strip(),
+                    "WEBITEL_PASSWORD": body.get("webitel_almaty_password", "").strip(),
+                    "WEBITEL_ASTANA_LOGIN": body.get("webitel_astana_login", "").strip(),
+                    "WEBITEL_ASTANA_PASSWORD": body.get("webitel_astana_password", "").strip(),
+                }
+                _save_env_updates(INFO_ENV_PATH, updates)
+                if updates["CRM_LOGIN"] or updates["CRM_PASSWORD"]:
+                    # Force the next CRM action to build a fresh session
+                    # under the new credentials instead of the old cached one.
+                    _crm_session = None
+                self._send_json(200, {"saved": True})
+                return
+
             if self.path == "/api/crm/login":
                 _get_crm_session().start_login()
                 self._send_json(200, {"started": True})
@@ -852,6 +1071,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if self.path == "/api/crm/login/status":
                 self._send_json(200, {"ready": _get_crm_session().is_logged_in()})
+                return
+
+            if self.path == "/api/crm/debug/login_check":  # temporary diagnostic
+                self._send_json(200, _get_crm_session().debug_login_check())
                 return
 
             if self.path == "/api/crm/pending_tickets":
@@ -876,13 +1099,13 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/webitel/plan":
                 template_extension = body.get("template_extension", "").strip()
                 target_extension = body.get("target_extension", "").strip()
+                city = body.get("city", "almaty").strip() or "almaty"
                 if not template_extension or not target_extension:
                     self._send_json(400, {"error": "template_extension and target_extension are required"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(city)
                 plan = actions.build_plan(template_extension=template_extension, target_extension=target_extension)
+                plan["city"] = city
                 self._send_json(200, plan)
                 return
 
@@ -891,22 +1114,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not plan:
                     self._send_json(400, {"error": "plan is required"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(plan.get("city", "almaty") or "almaty")
                 result = actions.execute_plan(plan)
                 self._send_json(200, result)
                 return
 
             if self.path == "/api/webitel/delete_plan":
                 extension = body.get("extension", "").strip()
+                city = body.get("city", "almaty").strip() or "almaty"
                 if not extension:
                     self._send_json(400, {"error": "extension is required"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(city)
                 plan = actions.build_delete_plan(extension)
+                plan["city"] = city
                 self._send_json(200, plan)
                 return
 
@@ -915,15 +1136,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not plan:
                     self._send_json(400, {"error": "plan is required"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(plan.get("city", "almaty") or "almaty")
                 result = actions.execute_delete_plan(plan)
                 self._send_json(200, result)
                 return
 
             if self.path == "/api/webitel/neighbors":
                 extension = body.get("extension", "").strip()
+                city = body.get("city", "almaty").strip() or "almaty"
                 if not extension:
                     self._send_json(400, {"error": "extension is required"})
                     return
@@ -935,9 +1155,7 @@ class Handler(BaseHTTPRequestHandler):
                 if radius < 1 or radius > 50:
                     self._send_json(400, {"error": "radius must be between 1 and 50"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(city)
                 neighbors = actions.find_neighbors(extension, radius=radius)
                 self._send_json(200, {"neighbors": neighbors})
                 return
@@ -947,18 +1165,18 @@ class Handler(BaseHTTPRequestHandler):
                 new_username = body.get("new_username", "").strip()
                 new_name = body.get("new_name", "").strip()
                 new_extension = body.get("new_extension", "").strip()
+                city = body.get("city", "almaty").strip() or "almaty"
                 if not template_extension or not new_username or not new_name or not new_extension:
                     self._send_json(400, {"error": "template_extension, new_username, new_name and new_extension are required"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(city)
                 plan = actions.build_create_plan(
                     template_extension=template_extension,
                     new_username=new_username,
                     new_name=new_name,
                     new_extension=new_extension,
                 )
+                plan["city"] = city
                 self._send_json(200, plan)
                 return
 
@@ -967,9 +1185,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not plan:
                     self._send_json(400, {"error": "plan is required"})
                     return
-                from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
-
-                actions = WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATH)
+                actions = _get_webitel_actions(plan.get("city", "almaty") or "almaty")
                 result = actions.execute_create_plan(plan)
                 self._send_json(200, result)
                 return

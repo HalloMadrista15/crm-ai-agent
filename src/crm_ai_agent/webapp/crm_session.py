@@ -33,7 +33,10 @@ from __future__ import annotations
 import json
 import queue
 import threading
+from pathlib import Path
 from typing import Any, Callable
+
+_DEBUG_SCREENSHOT_PATH = Path(__file__).resolve().parents[3] / ".auth" / "debug_login_check.png"
 
 # Confirmed 2026-09-21 via read-only OData recon (GET /0/odata/BnzVwApproval)
 # against the real "Задачи на согласование" list: this is the StatusId
@@ -159,16 +162,36 @@ class CrmSessionManager:
         thing), so operators kept seeing "запускаю..." long after they'd
         actually finished logging in. Checking real auth directly — a
         lightweight authenticated request from inside the page — tracks
-        what actually matters and isn't tied to SPA navigation timing."""
+        what actually matters and isn't tied to SPA navigation timing.
+
+        Confirmed 2026-09-28: the first version of this check hit
+        ``/0/odata/$metadata``, which turned out to be servable without
+        auth at all — it kept reporting "logged in" while the real browser
+        was still sitting on an MFA prompt. Switched to a real data query
+        (``BnzVwApproval?$top=1``), but that ALSO turned out to return 200
+        during the MFA prompt — this CRM apparently sets valid session
+        cookies as soon as username/password are accepted, before MFA is
+        confirmed, so any authenticated-but-not-MFA'd request already
+        succeeds. Now requires BOTH: the URL must have actually left
+        ``/Login/`` (a cheap, always-correct-while-MFA-is-pending signal —
+        the original page.url lag problem this whole check was built to
+        avoid only ever affected the few seconds *after* a real login,
+        never the MFA-pending state) AND the data query succeeding."""
 
         def _do(mgr: "CrmSessionManager") -> bool:
             if mgr._page is None:
                 return False
             try:
+                url = mgr._page.url.lower()
+            except Exception:
+                return False
+            if "/login/" in url:
+                return False
+            try:
                 status = mgr._page.evaluate(
                     """async () => {
                         try {
-                            const r = await fetch('/0/odata/$metadata', {credentials: 'include'});
+                            const r = await fetch('/0/odata/BnzVwApproval?$top=1', {credentials: 'include'});
                             return r.status;
                         } catch (e) {
                             return 0;
@@ -180,6 +203,49 @@ class CrmSessionManager:
             return status == 200
 
         return self._submit(_do, timeout=10.0)
+
+    def debug_login_check(self) -> dict[str, Any]:
+        """Temporary diagnostic: breaks is_logged_in's two conditions
+        apart so a failure can be attributed to one or the other."""
+
+        def _do(mgr: "CrmSessionManager") -> dict[str, Any]:
+            if mgr._page is None:
+                return {"has_page": False}
+            try:
+                url = mgr._page.url
+            except Exception as exc:
+                return {"has_page": True, "url_error": str(exc)}
+            on_login_url = "/login/" in url.lower()
+            try:
+                eval_result = mgr._page.evaluate(
+                    """async () => {
+                        try {
+                            const r = await fetch('/0/odata/BnzVwApproval?$top=1', {credentials: 'include'});
+                            const text = await r.text();
+                            return {status: r.status, body: text.slice(0, 300)};
+                        } catch (e) {
+                            return {status: 0, error: String(e)};
+                        }
+                    }"""
+                )
+            except Exception as exc:
+                eval_result = {"evaluate_threw": str(exc)}
+            shot_path = str(_DEBUG_SCREENSHOT_PATH)
+            try:
+                mgr._page.screenshot(path=shot_path)
+                screenshot_saved = True
+            except Exception:
+                screenshot_saved = False
+            return {
+                "has_page": True,
+                "url": url,
+                "on_login_url": on_login_url,
+                "fetch_result": eval_result,
+                "screenshot_saved": screenshot_saved,
+                "screenshot_path": shot_path,
+            }
+
+        return self._submit(_do, timeout=15.0)
 
     def list_pending_tickets(self, visa_owner_id: str) -> list[dict[str, str]]:
         """Read-only: lists real "Доступ к ИС" office-note tickets still

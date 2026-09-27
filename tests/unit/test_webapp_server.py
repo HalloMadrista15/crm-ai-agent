@@ -7,13 +7,15 @@ that code, e.g. a missing "url"), and never launches Playwright.
 """
 
 import json
+import tempfile
 import threading
 import unittest
 import urllib.error
 import urllib.request
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
-from crm_ai_agent.webapp.server import Handler
+from crm_ai_agent.webapp.server import Handler, _save_env_updates
 
 
 class TestConsoleServer(unittest.TestCase):
@@ -78,6 +80,50 @@ class TestConsoleServer(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("ready", payload)
         self.assertIsInstance(payload["ready"], bool)
+
+
+class TestSaveEnvUpdates(unittest.TestCase):
+    """Never exercised through the HTTP server in these tests — that would
+    write to the real project info.env (the server hardcodes that path).
+    Tests the pure function directly against a temp file instead."""
+
+    def test_writes_whitelisted_keys_to_a_fresh_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "info.env"
+            _save_env_updates(path, {"CRM_LOGIN": "i.ivanov", "CRM_PASSWORD": "hunter2"})
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("CRM_LOGIN=i.ivanov", content)
+            self.assertIn("CRM_PASSWORD=hunter2", content)
+
+    def test_empty_value_does_not_overwrite_existing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "info.env"
+            path.write_text("CRM_LOGIN=original\n", encoding="utf-8")
+            _save_env_updates(path, {"CRM_LOGIN": "", "CRM_PASSWORD": "new-pass"})
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("CRM_LOGIN=original", content)
+            self.assertIn("CRM_PASSWORD=new-pass", content)
+
+    def test_non_whitelisted_keys_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "info.env"
+            path.write_text("WEBITEL_ALMATY_BASE_URL=https://wtl-alm.example.invalid\n", encoding="utf-8")
+            _save_env_updates(path, {"WEBITEL_ALMATY_BASE_URL": "https://evil.invalid", "CRM_LOGIN": "i.ivanov"})
+            content = path.read_text(encoding="utf-8")
+            # Shared infra config is untouched by this endpoint even if a
+            # caller tries to pass it — only _SETTINGS_KEYS are writable.
+            self.assertIn("WEBITEL_ALMATY_BASE_URL=https://wtl-alm.example.invalid", content)
+            self.assertIn("CRM_LOGIN=i.ivanov", content)
+
+    def test_preserves_unrelated_existing_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "info.env"
+            path.write_text("CRM_BASE_URL=https://crm.example.invalid\nWEBITEL_DOMAIN=example.invalid\n", encoding="utf-8")
+            _save_env_updates(path, {"CRM_LOGIN": "i.ivanov"})
+            content = path.read_text(encoding="utf-8")
+            self.assertIn("CRM_BASE_URL=https://crm.example.invalid", content)
+            self.assertIn("WEBITEL_DOMAIN=example.invalid", content)
+            self.assertIn("CRM_LOGIN=i.ivanov", content)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,61 @@ def _actions() -> WebitelApiActions:
     return WebitelApiActions(base_url="https://wtl-alm.astana-motors.kz", session=SESSION)
 
 
+class TestFromInfoEnv(unittest.TestCase):
+    def test_defaults_to_almaty(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            info_env = Path(tmp) / "info.env"
+            info_env.write_text("WEBITEL_ALMATY_BASE_URL=https://alm.example.invalid\n", encoding="utf-8")
+            storage_state = Path(tmp) / "storage.json"
+            storage_state.write_text(
+                '{"cookies": [{"name": "WBTLAUTH", "value": "x"}, {"name": "WBTLCSRF", "value": "y"}],'
+                ' "origins": [{"origin": "https://alm.example.invalid", "localStorage": [{"name": "access-token", "value": "z"}]}]}',
+                encoding="utf-8",
+            )
+            actions = WebitelApiActions.from_info_env(info_env, storage_state)
+            self.assertEqual(actions._base_url, "https://alm.example.invalid")
+
+    def test_selects_astana_when_requested(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            info_env = Path(tmp) / "info.env"
+            info_env.write_text(
+                "WEBITEL_ALMATY_BASE_URL=https://alm.example.invalid\n"
+                "WEBITEL_ASTANA_BASE_URL=https://ast.example.invalid\n",
+                encoding="utf-8",
+            )
+            storage_state = Path(tmp) / "storage.json"
+            storage_state.write_text(
+                '{"cookies": [{"name": "WBTLAUTH", "value": "x"}, {"name": "WBTLCSRF", "value": "y"}],'
+                ' "origins": [{"origin": "https://ast.example.invalid", "localStorage": [{"name": "access-token", "value": "z"}]}]}',
+                encoding="utf-8",
+            )
+            actions = WebitelApiActions.from_info_env(info_env, storage_state, city="astana")
+            self.assertEqual(actions._base_url, "https://ast.example.invalid")
+
+    def test_raises_clear_error_for_missing_city_key(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            info_env = Path(tmp) / "info.env"
+            info_env.write_text("WEBITEL_ALMATY_BASE_URL=https://alm.example.invalid\n", encoding="utf-8")
+            storage_state = Path(tmp) / "storage.json"
+            storage_state.write_text(
+                '{"cookies": [{"name": "WBTLAUTH", "value": "x"}, {"name": "WBTLCSRF", "value": "y"}],'
+                ' "origins": [{"origin": "https://alm.example.invalid", "localStorage": [{"name": "access-token", "value": "z"}]}]}',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                WebitelApiActions.from_info_env(info_env, storage_state, city="astana")
+            self.assertIn("WEBITEL_ASTANA_BASE_URL", str(ctx.exception))
+
+
 class TestGetRawUser(unittest.TestCase):
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_returns_full_record(self, mock_urlopen) -> None:
