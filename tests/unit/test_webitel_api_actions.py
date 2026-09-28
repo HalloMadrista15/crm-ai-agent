@@ -497,6 +497,8 @@ class TestBuildDeletePlan(unittest.TestCase):
                 "username": "10087",
                 "group": "ALM-MK",
                 "presence_status": None,
+                "presence": [],
+                "in_call": False,
                 "device_ids": [],
             },
         )
@@ -538,6 +540,18 @@ class TestBuildDeletePlan(unittest.TestCase):
         ]
         plan = _actions().build_delete_plan("10078")
         self.assertEqual(plan["presence_status"], "{sip}")
+        self.assertEqual(plan["presence"], ["SIP"])
+        self.assertFalse(plan["in_call"])
+
+    def test_presence_labels_match_webitels_own_status_chips(self) -> None:
+        labels = WebitelApiActions.presence_labels
+        self.assertEqual(labels(None), [])
+        self.assertEqual(labels(""), [])
+        self.assertEqual(labels("{sip}"), ["SIP"])
+        self.assertEqual(labels("{web,sip,dlg}"), ["Web", "SIP", "Dlg"])
+        self.assertEqual(labels("{dnd}"), ["DnD"])
+        # An unknown marker still shows up — never silently treated as idle.
+        self.assertEqual(labels("{wss}"), ["wss"])
 
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_never_issues_a_write(self, mock_urlopen) -> None:
@@ -558,6 +572,7 @@ class TestExecuteDeletePlan(unittest.TestCase):
         mock_urlopen.side_effect = [
             _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # re-fetch search
             _FakeResponse({"id": "6078", "extension": "10087", "name": "Test User 10087"}),  # re-fetch full
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # presence re-check: idle
             _FakeResponse({}),  # POST .../logout response
             _FakeResponse(""),  # DELETE response (empty body)
         ]
@@ -574,11 +589,11 @@ class TestExecuteDeletePlan(unittest.TestCase):
             },
         )
 
-        logout_request = mock_urlopen.call_args_list[2].args[0]
+        logout_request = mock_urlopen.call_args_list[3].args[0]
         self.assertEqual(logout_request.get_method(), "POST")
         self.assertIn("/api/users/6078/logout", logout_request.full_url)
 
-        delete_request = mock_urlopen.call_args_list[3].args[0]
+        delete_request = mock_urlopen.call_args_list[4].args[0]
         self.assertEqual(delete_request.get_method(), "DELETE")
         self.assertIn("permanent=true", delete_request.full_url)
         self.assertIn("/api/users/6078", delete_request.full_url)
@@ -589,6 +604,7 @@ class TestExecuteDeletePlan(unittest.TestCase):
         mock_urlopen.side_effect = [
             _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # re-fetch search
             _FakeResponse({"id": "6078", "extension": "10087", "name": "Test User 10087"}),  # re-fetch full
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # presence re-check: idle
             _FakeResponse({}),  # POST .../logout
             _FakeResponse({}),  # DELETE device 150443
             _FakeResponse({}),  # DELETE device 150444
@@ -599,15 +615,15 @@ class TestExecuteDeletePlan(unittest.TestCase):
 
         self.assertEqual(result["deleted_device_ids"], ["150443", "150444"])
 
-        device_delete_1 = mock_urlopen.call_args_list[3].args[0]
+        device_delete_1 = mock_urlopen.call_args_list[4].args[0]
         self.assertEqual(device_delete_1.get_method(), "DELETE")
         self.assertIn("/api/devices/150443", device_delete_1.full_url)
 
-        device_delete_2 = mock_urlopen.call_args_list[4].args[0]
+        device_delete_2 = mock_urlopen.call_args_list[5].args[0]
         self.assertEqual(device_delete_2.get_method(), "DELETE")
         self.assertIn("/api/devices/150444", device_delete_2.full_url)
 
-        user_delete = mock_urlopen.call_args_list[5].args[0]
+        user_delete = mock_urlopen.call_args_list[6].args[0]
         self.assertEqual(user_delete.get_method(), "DELETE")
         self.assertIn("/api/users/6078", user_delete.full_url)
 
@@ -621,13 +637,32 @@ class TestExecuteDeletePlan(unittest.TestCase):
         mock_urlopen.side_effect = [
             _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),
             _FakeResponse({"id": "6078", "extension": "10087"}),
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # presence re-check: idle
             _FakeResponse({}),
             _FakeResponse(""),
         ]
         _actions().execute_delete_plan(plan)
 
         methods = [call.args[0].get_method() for call in mock_urlopen.call_args_list]
-        self.assertEqual(methods, ["GET", "GET", "POST", "DELETE"])
+        self.assertEqual(methods, ["GET", "GET", "GET", "POST", "DELETE"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_to_delete_someone_in_a_call_even_if_the_plan_said_idle(self, mock_urlopen) -> None:
+        """A call may start between "Показать план" and "Подтвердить": the
+        status is re-checked at delete time, and a user in Dlg is neither
+        logged out (that would drop the call) nor deleted."""
+
+        plan = {"extension": "10087", "id": "6078", "name": "x", "presence": [], "in_call": False}
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),
+            _FakeResponse({"id": "6078", "extension": "10087"}),
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087", "presence": {"status": "{sip,dlg}"}}]}),
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(plan)
+        self.assertIn("Dlg", str(ctx.exception))
+        methods = [call.args[0].get_method() for call in mock_urlopen.call_args_list]
+        self.assertEqual(methods, ["GET", "GET", "GET"])
 
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_refuses_when_extension_now_belongs_to_a_different_user(self, mock_urlopen) -> None:
@@ -650,6 +685,7 @@ class TestExecuteDeletePlan(unittest.TestCase):
         mock_urlopen.side_effect = [
             _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),
             _FakeResponse({"id": "6078", "extension": "10087"}),
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # presence re-check: idle
             _FakeResponse({}),  # POST .../logout succeeds
             urllib.error.HTTPError(
                 url="https://wtl-alm.astana-motors.kz/api/users/6078",

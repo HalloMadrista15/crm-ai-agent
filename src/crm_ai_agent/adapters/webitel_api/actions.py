@@ -151,6 +151,12 @@ class WebitelApiActions:
         except urllib.error.URLError as exc:
             raise WebitelApiError(f"POST {path} failed: {exc.reason}") from exc
 
+    def check_session(self) -> None:
+        """Read-only: the cheapest authenticated request, so the console can
+        tell an active saved session from an expired one. Raises
+        WebitelApiError (HTTP 401 when expired)."""
+        self._get("/api/users?page=1&size=1&fields=id")
+
     def get_raw_user(self, extension: str) -> dict[str, Any]:
         """The full, unmodified user record — everything a PUT body needs
         to carry through unchanged. Raises SubjectNotFoundError if no user
@@ -355,6 +361,18 @@ class WebitelApiActions:
         presence = matches[0].get("presence")
         return presence.get("status") if presence else None
 
+    @staticmethod
+    def presence_labels(status: str | None) -> list[str]:
+        """get_presence_status's marker ("{sip}", "{web,sip}", ...) as the
+        chip names Webitel's own user list shows (Web/SIP/Dlg/DnD); empty
+        when the user is idle. Unknown markers are passed through as-is
+        rather than dropped, so nothing active is ever hidden."""
+        if not status:
+            return []
+        known = {"web": "Web", "sip": "SIP", "dlg": "Dlg", "dnd": "DnD"}
+        parts = [part.strip() for part in status.strip().strip("{}").split(",") if part.strip()]
+        return [known.get(part.lower(), part) for part in parts]
+
     def build_delete_plan(self, extension: str) -> dict[str, Any]:
         """Read-only: one lookup of the user to be deleted, so the
         approver sees exactly who/what they're about to permanently
@@ -375,6 +393,10 @@ class WebitelApiActions:
             "username": user.get("username", ""),
             "group": (user.get("profile") or {}).get("group", ""),
             "presence_status": presence_status,
+            "presence": self.presence_labels(presence_status),
+            # Never delete someone mid-call: execute_delete_plan re-checks
+            # this at confirm time too, since the plan can be stale.
+            "in_call": "Dlg" in self.presence_labels(presence_status),
             "device_ids": [d["id"] for d in user.get("devices", []) if d.get("id")],
         }
 
@@ -407,6 +429,12 @@ class WebitelApiActions:
             raise WebitelApiError(
                 f"extension={plan['extension']!r} now belongs to a different user "
                 f"(id {fresh['id']!r}, was {plan['id']!r} when the plan was built) — refusing to delete"
+            )
+        # Re-checked here, not trusted from the plan: a call may have
+        # started since "Показать план". Logging out would drop it.
+        if "Dlg" in self.presence_labels(self.get_presence_status(plan["extension"])):
+            raise WebitelApiError(
+                f"{plan['extension']} сейчас в разговоре (Dlg) — удаление отменено, повторите после окончания звонка"
             )
         self._post(f"/api/users/{plan['id']}/logout", {})
         for device_id in plan.get("device_ids", []):

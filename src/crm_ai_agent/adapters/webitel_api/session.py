@@ -45,7 +45,7 @@ def load_session(storage_state_path: Path) -> WebitelApiSession:
     if not storage_state_path.exists():
         raise WebitelSessionError(
             f"No saved Webitel session at {storage_state_path}. "
-            "Run scripts/webitel_login_and_save_session.py first."
+            "Log in via the console («Вход и настройки» → «Вход в Webitel») first."
         )
     data = json.loads(storage_state_path.read_text(encoding="utf-8"))
 
