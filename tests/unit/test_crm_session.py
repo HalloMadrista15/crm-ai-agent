@@ -19,7 +19,9 @@ import unittest
 from crm_ai_agent.webapp.crm_session import (
     _APPROVAL_STATUS_PENDING,
     CrmSessionError,
+    CrmSessionExpired,
     CrmSessionManager,
+    desktop_user_agent,
     _own_visa_owner_ids,
     _read_field_value,
     _visa_owner_filter,
@@ -72,6 +74,8 @@ class _FakePage:
         return False
 
     def evaluate(self, script: str, arg: object = None) -> object:
+        if script == "location.href":  # _on_login_page's probe, not a data request
+            return self.url
         self.evaluate_calls.append(arg)
         if "location.href" in script:
             # is_logged_in's probe: the page's live URL plus the OData status.
@@ -308,6 +312,8 @@ class TestListPendingTickets(unittest.TestCase):
 
         class _RolesPage(_FakePage):
             def evaluate(self, script: str, arg: object = None) -> object:
+                if script == "location.href":
+                    return self.url
                 if "SysAdminUnitInRole" in script:
                     roles = [{"SysAdminUnitRoleId": "role-network"}, {"SysAdminUnitRoleId": "role-it"}]
                     return {"user": "user-me", "status": 200, "body": _json.dumps({"value": roles})}
@@ -403,7 +409,7 @@ class TestConfirmationCode(unittest.TestCase):
 
     def test_progress_without_a_page_asks_for_nothing(self) -> None:
         self.mgr._page = None
-        self.assertEqual(self.mgr.login_progress(), {"code_required": False, "error_text": ""})
+        self.assertEqual(self.mgr.login_progress(), {"code_required": False, "error_text": "", "logged_out": False})
 
 
 class TestApprovals(unittest.TestCase):
@@ -484,6 +490,45 @@ class TestApprovals(unittest.TestCase):
         with self.assertRaises(CrmSessionError):
             self.mgr.read_approvals("id-1")
         self.assertIsNone(self.mgr._approval_source)
+
+
+class TestExpiredSession(unittest.TestCase):
+    """Seen 2026-09-28: the CRM logged the (headless) browser out and the
+    console only reported a cryptic "Could not read ticket" error."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.mgr = CrmSessionManager(base_url="https://crm.astana-motors.kz")
+
+    def test_ticket_on_the_login_page_means_the_session_expired(self) -> None:
+        class _RedirectsToLogin(_FakePage):
+            def goto(self, url: str, wait_until: str | None = None) -> None:
+                pass  # the real CRM bounces a logged-out browser back to /Login/
+
+        self.mgr._page = _RedirectsToLogin(url="https://crm.astana-motors.kz/Login/NuiLogin.aspx?ReturnUrl=%2f")
+        with self.assertRaises(CrmSessionExpired):
+            self.mgr.read_ticket("https://crm.astana-motors.kz/0/Nui/ViewModule.aspx#x/edit/1")
+
+    def test_pending_list_on_the_login_page_means_the_session_expired(self) -> None:
+        self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/Login/NuiLogin.aspx")
+        with self.assertRaises(CrmSessionExpired):
+            self.mgr.list_pending_tickets("owner-1")
+
+    def test_odata_answering_with_the_login_html_means_the_session_expired(self) -> None:
+        self.mgr._page = _FakePage(
+            url="https://crm.astana-motors.kz/0/Nui/ViewModule.aspx",
+            evaluate_result={"status": 200, "body": "<!DOCTYPE html><html>login</html>"},
+        )
+        with self.assertRaises(CrmSessionExpired):
+            self.mgr.list_pending_tickets("owner-1")
+
+    def test_expired_is_still_a_crm_session_error(self) -> None:
+        self.assertTrue(issubclass(CrmSessionExpired, CrmSessionError))
+
+    def test_headless_browser_presents_a_normal_chrome_user_agent(self) -> None:
+        ua = desktop_user_agent("131.0.6778.33")
+        self.assertIn("Chrome/131.0.6778.33", ua)
+        self.assertNotIn("Headless", ua)
 
 
 class TestVisaOwnerHelpers(unittest.TestCase):

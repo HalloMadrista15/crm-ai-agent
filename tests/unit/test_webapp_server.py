@@ -124,6 +124,18 @@ class TestConsoleServer(unittest.TestCase):
         self.assertIn("CRM_BASE_URL=https://crm.example.invalid", content)
         self.assertIn("WEBITEL_LOGIN=10078", content)
 
+    def test_expired_crm_session_is_a_401_the_page_can_act_on(self) -> None:
+        from crm_ai_agent.webapp.crm_session import CrmSessionExpired
+
+        class _Session:
+            def read_ticket(self, url: str) -> dict:
+                raise CrmSessionExpired()
+
+        with mock.patch.object(server, "_get_crm_session", return_value=_Session()):
+            status, payload = self._post("/api/crm/ticket", {"url": "https://crm.example.invalid/0/x/edit/1"})
+        self.assertEqual(status, 401)
+        self.assertIs(payload["crm_session_expired"], True)
+
     def test_copy_plan_carries_the_reset_password_checkbox(self) -> None:
         """Bug found 2026-09-28: the "Также сбросить пароль" checkbox was
         never sent, so execute_plan never reset anything."""
@@ -144,7 +156,41 @@ class TestConsoleServer(unittest.TestCase):
     def test_confirmation_code_endpoint_rejects_non_digits_before_touching_the_crm(self) -> None:
         status, payload = self._post("/api/crm/login/code", {"code": "abc"})
         self.assertEqual(status, 400)
-        self.assertIn("цифры", payload["error"])
+        self.assertIn("6 цифр", payload["error"])
+
+    def test_webitel_credentials_save_uses_each_citys_own_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "info.env"
+            env.write_text("WEBITEL_DOMAIN=mycar-almaty.example.invalid\n", encoding="utf-8")
+            with mock.patch.object(server, "INFO_ENV_PATH", env):
+                self._post("/api/webitel/credentials/save", {"city": "almaty", "login": "10078", "password": "pw-a"})
+                self._post("/api/webitel/credentials/save", {"city": "astana", "login": "m.muratbay", "password": "pw-b"})
+                status, payload = self._post("/api/webitel/credentials/save", {"city": "astana", "login": "x"})
+            content = env.read_text(encoding="utf-8")
+        for line in ("WEBITEL_LOGIN=10078", "WEBITEL_PASSWORD=pw-a", "WEBITEL_ASTANA_LOGIN=m.muratbay",
+                     "WEBITEL_ASTANA_PASSWORD=pw-b", "WEBITEL_DOMAIN=mycar-almaty.example.invalid"):
+            self.assertIn(line, content)
+        self.assertEqual(status, 400)
+        self.assertIn("пароль", payload["error"])
+
+    def test_webitel_credentials_forget_removes_login_password_and_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env = Path(tmp) / "info.env"
+            env.write_text("WEBITEL_LOGIN=10078\nWEBITEL_PASSWORD=pw\nWEBITEL_ASTANA_LOGIN=keep\nWEBITEL_ALMATY_BASE_URL=https://a\n", encoding="utf-8")
+            paths = {"almaty": Path(tmp) / "a.json", "astana": Path(tmp) / "b.json"}
+            paths["almaty"].write_text("{}", encoding="utf-8")
+            paths["astana"].write_text("{}", encoding="utf-8")
+            with mock.patch.object(server, "INFO_ENV_PATH", env), mock.patch.dict(server.WEBITEL_STORAGE_STATE_PATHS, paths):
+                status, _ = self._post("/api/webitel/credentials/forget", {"city": "almaty"})
+            content = env.read_text(encoding="utf-8")
+            almaty_session_left, astana_session_left = paths["almaty"].exists(), paths["astana"].exists()
+        self.assertEqual(status, 200)
+        self.assertNotIn("WEBITEL_LOGIN=", content)
+        self.assertNotIn("WEBITEL_PASSWORD=", content)
+        self.assertIn("WEBITEL_ASTANA_LOGIN=keep", content)
+        self.assertIn("WEBITEL_ALMATY_BASE_URL=https://a", content)
+        self.assertFalse(almaty_session_left)
+        self.assertTrue(astana_session_left)
 
     def test_webitel_session_status_rejects_unknown_city(self) -> None:
         status, _ = self._post("/api/webitel/session_status", {"city": "shymkent"})
@@ -153,13 +199,16 @@ class TestConsoleServer(unittest.TestCase):
     def test_webitel_session_status_without_a_saved_session_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             env = Path(tmp) / "info.env"
-            env.write_text("WEBITEL_ASTANA_BASE_URL=https://wtl-ast.example.invalid\nWEBITEL_ASTANA_LOGIN=m.muratbay\n", encoding="utf-8")
+            env.write_text(
+                "WEBITEL_ASTANA_BASE_URL=https://wtl-ast.example.invalid\nWEBITEL_ASTANA_LOGIN=m.muratbay\nWEBITEL_ASTANA_PASSWORD=secret-pw\n",
+                encoding="utf-8",
+            )
             paths = {"almaty": Path(tmp) / "a.json", "astana": Path(tmp) / "b.json"}
             with mock.patch.object(server, "INFO_ENV_PATH", env), mock.patch.dict(server.WEBITEL_STORAGE_STATE_PATHS, paths):
                 status, payload = self._post("/api/webitel/session_status", {"city": "astana"})
         self.assertEqual(status, 200)
-        self.assertEqual((payload["session"], payload["login"], payload["configured"]), ("missing", "m.muratbay", False))
-        self.assertNotIn("password", json.dumps(payload))
+        self.assertEqual((payload["session"], payload["login"], payload["has_password"]), ("missing", "m.muratbay", True))
+        self.assertNotIn("secret-pw", json.dumps(payload))  # only whether one is saved, never the password
 
     def test_webitel_login_without_saved_credentials_explains_where_to_enter_them(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -294,7 +343,7 @@ class TestConfirmationCodeFormat(unittest.TestCase):
         self.assertEqual(server._normalize_confirmation_code("12-34-56"), "123456")
 
     def test_anything_else_is_rejected(self) -> None:
-        for bad in ("", None, "abc123", "12", "12345678901"):
+        for bad in ("", None, "abc123", "12", "12345", "1234567", "12345678901"):
             with self.assertRaises(ValueError):
                 server._normalize_confirmation_code(bad)
 

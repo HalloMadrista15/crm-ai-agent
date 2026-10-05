@@ -3,12 +3,17 @@ in with their own account instead of running scripts/webitel_*_login_and_
 save_session.py by hand.
 
 Same flow as those scripts (confirmed working against both real instances
-on 2026-09-28): open a VISIBLE browser, fill domain / username / password
-through Webitel's multi-step form, let the human type any confirmation code
-themselves, detect completion by URL/password-field polling, then save the
-Playwright storage_state that WebitelApiActions reads its cookies and
+on 2026-09-28): fill domain / username / password through Webitel's
+multi-step form, detect completion by URL/password-field polling, then save
+the Playwright storage_state that WebitelApiActions reads its cookies and
 access-token from. Nothing is ever clicked after the login form — the
 session is only saved, never used here.
+
+The browser is headless (changed 2026-09-29 at the operator's request — no
+windows popping up); Webitel's own error lines end the attempt right away
+instead of a silent wait, and every step is screenshotted for the console's
+"Что было на экране Webitel". WEBITEL_SHOW_BROWSER=1 in info.env shows the
+window again (then a human can also finish an unusual login by hand).
 
 Each login runs in its own thread with its own Playwright instance (the
 sync API is thread-affine), separate from the long-lived CRM browser in
@@ -21,6 +26,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from crm_ai_agent.webapp.crm_session import desktop_user_agent
 
 # Per-city info.env keys. Almaty's login keys predate multi-city support and
 # keep their original unprefixed names.
@@ -52,7 +59,8 @@ _SUBMIT_SELECTORS = [
     "button:has-text('Continue')", "button:has-text('Продолжить')",
 ]
 
-LOGIN_TIMEOUT_SECONDS = 10 * 60
+LOGIN_TIMEOUT_SECONDS = 10 * 60  # visible window: a human may finish by hand
+HEADLESS_LOGIN_TIMEOUT_SECONDS = 90
 _POLL_SECONDS = 2
 _STABLE_SECONDS = 5
 
@@ -75,11 +83,41 @@ def looks_logged_in(*, initial_url: str, current_url: str, seen_password_field: 
     return left_login_url or (seen_password_field and password_fields_now == 0)
 
 
+def page_problem(page: Any) -> str:
+    """An operator-facing reason the headless login can't go on, read from
+    the Webitel page itself: its own error line (e.g. a wrong password) or a
+    confirmation-code prompt. Empty while the login is still progressing."""
+    try:
+        return page.evaluate(
+            r"""() => {
+                if (!/auth|login|signin/i.test(location.href)) return '';
+                const lines = (document.body ? document.body.innerText : '').split('\n').map(l => l.trim()).filter(Boolean);
+                const error = lines.find(l => l.length < 200 && /invalid|incorrect|wrong|denied|not found|expired|неверн|ошибк|не найден/i.test(l));
+                if (error) return 'Webitel: ' + error;
+                if (lines.some(l => l.length < 200 && /verification code|one-time|2fa|otp|код подтвержд/i.test(l))) {
+                    return 'Webitel просит код подтверждения — впишите WEBITEL_SHOW_BROWSER=1 в info.env и войдите заново, окно откроется';
+                }
+                return '';
+            }"""
+        ) or ""
+    except Exception:
+        return ""
+
+
+def latest_screenshot(storage_state_path: Path, city: str) -> bytes | None:
+    """The last login step's screenshot for this city (the failure shot if
+    there is one), for the console's "Что было на экране Webitel"."""
+    debug_dir = storage_state_path.parent / "webitel_login_debug" / city
+    shots = sorted(debug_dir.glob("*.png"), key=lambda f: f.stat().st_mtime) if debug_dir.exists() else []
+    return shots[-1].read_bytes() if shots else None
+
+
 class WebitelLoginJob:
     """One visible-browser login for one city. ``state`` is "running", then
     "done" or "failed" (with ``error``)."""
 
-    def __init__(self, *, city: str, config: dict[str, str], storage_state_path: Path) -> None:
+    def __init__(self, *, city: str, config: dict[str, str], storage_state_path: Path, show_browser: bool = False) -> None:
+        self._show_browser = show_browser
         self.city = city
         self.login = config["login"]
         self._config = config
@@ -109,9 +147,9 @@ class WebitelLoginJob:
         from crm_ai_agent.adapters.webitel_api.session import load_session
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=False)
+            browser = p.chromium.launch(headless=not self._show_browser)
             try:
-                page = browser.new_context().new_page()
+                page = browser.new_context(user_agent=desktop_user_agent(browser.version)).new_page()
                 page.goto(self._config["base_url"], wait_until="domcontentloaded")
                 # Confirmed 2026-09-28: a fixed 1.5s wait was sometimes too
                 # short for the Vue form to render — the Next button got
@@ -182,15 +220,23 @@ class WebitelLoginJob:
                     page.wait_for_timeout(1500)
                 snapshot("after_form")
 
-                # The human may still need to type a confirmation code or fix
-                # a wrong password in the window — wait for them.
-                deadline = time.monotonic() + LOGIN_TIMEOUT_SECONDS
+                # Wait for the login to settle. With a visible window a human
+                # may still fix things by hand; headless, Webitel's own error
+                # line (or a code prompt) ends the attempt straight away.
+                timeout = LOGIN_TIMEOUT_SECONDS if self._show_browser else HEADLESS_LOGIN_TIMEOUT_SECONDS
+                deadline = time.monotonic() + timeout
                 stable_since: float | None = None
                 while True:
                     if page.is_closed():
                         raise RuntimeError("окно Webitel закрыто до завершения входа")
                     if time.monotonic() > deadline:
-                        raise RuntimeError("вход не завершён за 10 минут")
+                        snapshot("failed")
+                        raise RuntimeError(f"вход не завершён за {timeout // 60 or 1} мин" if timeout >= 60 else "вход не завершён")
+                    if not self._show_browser:
+                        problem = page_problem(page)
+                        if problem:
+                            snapshot("failed")
+                            raise RuntimeError(problem)
                     try:
                         password_fields = page.locator("input[type='password']").count()
                     except Exception:

@@ -28,8 +28,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-from crm_ai_agent.webapp.crm_session import CrmSessionManager
-from crm_ai_agent.webapp.webitel_login import WebitelLoginJob, city_config
+from crm_ai_agent.webapp.crm_session import CrmSessionExpired, CrmSessionManager
+from crm_ai_agent.webapp.webitel_login import WEBITEL_CITY_KEYS, WebitelLoginJob, city_config, latest_screenshot
 
 ROOT = Path(__file__).resolve().parents[3]
 INFO_ENV_PATH = ROOT / "info.env"
@@ -95,6 +95,7 @@ def _webitel_session_state(city: str) -> dict[str, Any]:
         "city": city,
         "login": config["login"],
         "configured": all(config.values()),
+        "has_password": bool(config["password"]),
         "job": job.snapshot() if job else None,
     }
     if not config["base_url"]:
@@ -111,6 +112,23 @@ def _webitel_session_state(city: str) -> dict[str, Any]:
     return state
 
 
+def _save_webitel_credentials(city: str, login: str, password: str) -> None:
+    """This operator's own Webitel account for one city, into info.env.
+    Raises ValueError with an operator-facing message."""
+    if not login or not password:
+        raise ValueError("Введите и логин, и пароль Webitel")
+    keys = WEBITEL_CITY_KEYS[city]
+    _save_env_updates(INFO_ENV_PATH, {keys["login"]: login, keys["password"]: password})
+
+
+def _forget_webitel_credentials(city: str) -> None:
+    """Removes this city's remembered Webitel login/password AND its saved
+    session — otherwise the console would keep acting as that account."""
+    keys = WEBITEL_CITY_KEYS[city]
+    _remove_env_keys(INFO_ENV_PATH, (keys["login"], keys["password"]))
+    WEBITEL_STORAGE_STATE_PATHS[city].unlink(missing_ok=True)
+
+
 def _start_webitel_login(city: str) -> dict[str, Any]:
     """Raises ValueError with an operator-facing message when this city's
     login can't start (missing credentials or address)."""
@@ -123,7 +141,12 @@ def _start_webitel_login(city: str) -> dict[str, Any]:
     job = _webitel_login_jobs.get(city)
     if job and job.state == "running":
         return {"started": False, "running": True}
-    _webitel_login_jobs[city] = WebitelLoginJob(city=city, config=config, storage_state_path=WEBITEL_STORAGE_STATE_PATHS[city])
+    _webitel_login_jobs[city] = WebitelLoginJob(
+        city=city,
+        config=config,
+        storage_state_path=WEBITEL_STORAGE_STATE_PATHS[city],
+        show_browser=_load_env_file(INFO_ENV_PATH).get("WEBITEL_SHOW_BROWSER") == "1",
+    )
     return {"started": True, "login": config["login"]}
 
 
@@ -218,11 +241,11 @@ def _get_crm_session() -> CrmSessionManager:
 
 
 def _normalize_confirmation_code(raw: Any) -> str:
-    """The authenticator code typed into the console: digits only (spaces
-    and dashes people paste in are dropped), 4-10 of them."""
+    """The authenticator code typed into the console: always exactly 6
+    digits for this CRM (spaces and dashes people paste in are dropped)."""
     code = re.sub(r"[\s-]", "", str(raw or ""))
-    if not re.fullmatch(r"\d{4,10}", code):
-        raise ValueError("Код подтверждения — это цифры из приложения-аутентификатора")
+    if not re.fullmatch(r"\d{6}", code):
+        raise ValueError("Код подтверждения — 6 цифр из приложения-аутентификатора")
     return code
 
 
@@ -408,12 +431,14 @@ _INDEX_HTML = """<!doctype html>
   .split-side > .row{margin-top:12px;}
   .split-placeholder{display:none;}
   .login-column{display:flex;flex-direction:column;gap:16px;}
+  .code-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:16px;padding:10px 14px;border:1px solid var(--warn);background:var(--warn-soft);border-radius:10px;color:var(--text);font-weight:600;}
   .code-box{margin:12px 0 0;padding:12px;border:1px solid var(--warn);background:var(--warn-soft);border-radius:10px;}
   .code-box input{font-size:18px;letter-spacing:.2em;font-variant-numeric:tabular-nums;}
   .screenshot-btn{margin-top:10px;}
   .crm-screenshot{display:block;width:100%;margin-top:10px;border:1px solid var(--border);border-radius:8px;}
   .webitel-city{padding:12px 0;border-bottom:1px solid var(--border);}
   .webitel-city:first-child{padding-top:0;}
+  .webitel-city [data-role="form"]{margin-bottom:12px;}
   .webitel-city-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px;}
   .webitel-city-login{font-size:12.5px;color:var(--text-soft);margin-bottom:8px;}
   .webitel-city-login b{color:var(--text);}
@@ -473,6 +498,7 @@ _INDEX_HTML = """<!doctype html>
   </div>
 </nav>
 <div class="page">
+  <div id="crmCodeBanner" class="code-banner" hidden>CRM просит код подтверждения. <button type="button" id="btnGoToCode">Ввести код</button></div>
   <div class="sub top-sub">Локальный инструмент. Только на этом компьютере. Каждое реальное изменение требует отдельного подтверждения.</div>
 
   <div class="city-picker" id="cityPicker">
@@ -493,26 +519,6 @@ _INDEX_HTML = """<!doctype html>
         <div class="field-group">
           <label class="field-label" for="settingsCrmVisaOwnerId">CRM Visa Owner ID (необязательно)</label>
           <input type="text" id="settingsCrmVisaOwnerId" placeholder="пусто — ваши задачи и задачи всех ваших ролей" autocomplete="off">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field-group">
-          <label class="field-label" for="settingsWebitelAlmatyLogin">Webitel Алматы — логин</label>
-          <input type="text" id="settingsWebitelAlmatyLogin" placeholder="Логин" autocomplete="off">
-        </div>
-        <div class="field-group">
-          <label class="field-label" for="settingsWebitelAlmatyPassword">Webitel Алматы — пароль</label>
-          <input type="password" id="settingsWebitelAlmatyPassword" placeholder="••••••••" autocomplete="off">
-        </div>
-      </div>
-      <div class="row">
-        <div class="field-group">
-          <label class="field-label" for="settingsWebitelAstanaLogin">Webitel Астана — логин</label>
-          <input type="text" id="settingsWebitelAstanaLogin" placeholder="Логин" autocomplete="off">
-        </div>
-        <div class="field-group">
-          <label class="field-label" for="settingsWebitelAstanaPassword">Webitel Астана — пароль</label>
-          <input type="password" id="settingsWebitelAstanaPassword" placeholder="••••••••" autocomplete="off">
         </div>
       </div>
       <div class="row">
@@ -560,7 +566,7 @@ _INDEX_HTML = """<!doctype html>
         <label class="field-label" for="crmCode">Код подтверждения из приложения-аутентификатора</label>
         <div class="row">
           <div class="field-group">
-            <input type="text" id="crmCode" inputmode="numeric" autocomplete="one-time-code" maxlength="12" placeholder="000000">
+            <input type="text" id="crmCode" inputmode="numeric" autocomplete="one-time-code" placeholder="000000">
           </div>
           <button type="button" id="btnCrmCode">Подтвердить</button>
         </div>
@@ -576,15 +582,63 @@ _INDEX_HTML = """<!doctype html>
     <div class="card-body">
       <div class="webitel-city" data-city="almaty">
         <div class="webitel-city-head"><b>Алматы</b><span class="pill neutral" data-role="status">проверяю...</span></div>
-        <div class="webitel-city-login" data-role="login"></div>
+        <div class="saved-login" data-role="saved" hidden>
+          <span class="saved-login-text">Сохранённый вход: <b data-role="saved-name"></b></span>
+          <span class="saved-login-actions">
+            <button type="button" class="ghost" data-role="change">Сменить</button>
+            <button type="button" class="ghost icon-btn" data-role="forget" title="Удалить сохранённый вход" aria-label="Удалить сохранённый вход">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+            </button>
+          </span>
+        </div>
+        <div data-role="form" hidden>
+          <div class="row">
+            <div class="field-group">
+              <label class="field-label">Логин Webitel Алматы</label>
+              <input type="text" data-role="login-input" placeholder="Логин" autocomplete="off">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field-group">
+              <label class="field-label">Пароль</label>
+              <input type="password" data-role="password-input" placeholder="••••••••" autocomplete="off">
+            </div>
+          </div>
+        </div>
         <button type="button" class="ghost" data-role="login-btn">Войти</button>
         <div class="msg info" data-role="msg"></div>
+        <button type="button" class="ghost screenshot-btn" data-role="shot-btn" hidden>Что было на экране Webitel</button>
+        <img class="crm-screenshot" data-role="shot" alt="Экран Webitel" hidden>
       </div>
       <div class="webitel-city" data-city="astana">
         <div class="webitel-city-head"><b>Астана</b><span class="pill neutral" data-role="status">проверяю...</span></div>
-        <div class="webitel-city-login" data-role="login"></div>
+        <div class="saved-login" data-role="saved" hidden>
+          <span class="saved-login-text">Сохранённый вход: <b data-role="saved-name"></b></span>
+          <span class="saved-login-actions">
+            <button type="button" class="ghost" data-role="change">Сменить</button>
+            <button type="button" class="ghost icon-btn" data-role="forget" title="Удалить сохранённый вход" aria-label="Удалить сохранённый вход">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+            </button>
+          </span>
+        </div>
+        <div data-role="form" hidden>
+          <div class="row">
+            <div class="field-group">
+              <label class="field-label">Логин Webitel Астана</label>
+              <input type="text" data-role="login-input" placeholder="Логин" autocomplete="off">
+            </div>
+          </div>
+          <div class="row">
+            <div class="field-group">
+              <label class="field-label">Пароль</label>
+              <input type="password" data-role="password-input" placeholder="••••••••" autocomplete="off">
+            </div>
+          </div>
+        </div>
         <button type="button" class="ghost" data-role="login-btn">Войти</button>
         <div class="msg info" data-role="msg"></div>
+        <button type="button" class="ghost screenshot-btn" data-role="shot-btn" hidden>Что было на экране Webitel</button>
+        <img class="crm-screenshot" data-role="shot" alt="Экран Webitel" hidden>
       </div>
     </div>
   </div>
@@ -645,7 +699,7 @@ _INDEX_HTML = """<!doctype html>
         </div>
         <label class="checkbox-row">
           <input type="checkbox" id="resetPasswordCheck">
-          Также сбросить пароль (сгенерировать новый)
+          Сбросить пароль
         </label>
         <div class="row">
           <button id="btnPlan">Показать план</button>
@@ -803,7 +857,11 @@ async function api(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  if (!res.ok) {
+    const err = new Error(data.error || ('HTTP ' + res.status));
+    err.data = data;
+    throw err;
+  }
   return data;
 }
 
@@ -865,10 +923,6 @@ document.getElementById('btnSettingsSave').addEventListener('click', async () =>
   const btn = document.getElementById('btnSettingsSave');
   const payload = {
     crm_visa_owner_id: document.getElementById('settingsCrmVisaOwnerId').value.trim(),
-    webitel_almaty_login: document.getElementById('settingsWebitelAlmatyLogin').value.trim(),
-    webitel_almaty_password: document.getElementById('settingsWebitelAlmatyPassword').value,
-    webitel_astana_login: document.getElementById('settingsWebitelAstanaLogin').value.trim(),
-    webitel_astana_password: document.getElementById('settingsWebitelAstanaPassword').value,
   };
   btn.disabled = true;
   msgEl.className = 'msg info';
@@ -876,11 +930,7 @@ document.getElementById('btnSettingsSave').addEventListener('click', async () =>
   try {
     await api('/api/settings/save', payload);
     msgEl.className = 'msg info';
-    msgEl.textContent = 'Сохранено на этом компьютере (пустые поля не тронуты). Верность пароля проверится при входе — кнопка «Войти» в «Вход в Webitel».';
-    // Clear password fields from the DOM after saving so they do not linger visible.
-    document.getElementById('settingsWebitelAlmatyPassword').value = '';
-    document.getElementById('settingsWebitelAstanaPassword').value = '';
-    WEBITEL_CITIES.forEach(refreshWebitelCity);
+    msgEl.textContent = 'Сохранено';
   } catch (e) {
     msgEl.textContent = 'Ошибка: ' + e.message;
     msgEl.className = 'msg error';
@@ -898,6 +948,9 @@ const WEBITEL_SESSION_PILLS = {
   error: ['ошибка проверки', 'pill critical'],
 };
 const webitelPolling = {};
+const webitelEditing = {};
+const webitelLast = {};
+const WEBITEL_CITY_NAMES = {almaty: 'Алматы', astana: 'Астана'};
 
 function renderWebitelCity(city, data) {
   const box = document.querySelector(`.webitel-city[data-city="${city}"]`);
@@ -908,17 +961,27 @@ function renderWebitelCity(city, data) {
   const [text, cls] = running ? ['вход...', 'pill warn'] : (WEBITEL_SESSION_PILLS[data.session] || WEBITEL_SESSION_PILLS.error);
   pill.textContent = text;
   pill.className = cls;
-  box.querySelector('[data-role="login"]').innerHTML = data.login
-    ? `Войдёт как: <b>${esc(data.login)}</b>`
-    : 'Логин не указан — впишите его и пароль в «Настройках»';
-  btn.disabled = running || !data.configured;
-  btn.textContent = data.session === 'active' ? 'Войти заново' : 'Войти';
+  webitelLast[city] = data;
+  // Same pattern as the CRM card: a remembered account shows as a row with
+  // "Сменить" and a trash button; otherwise (or while changing) the fields.
+  const saved = !!(data.login && data.has_password);
+  const editing = !saved || !!webitelEditing[city];
+  box.querySelector('[data-role="saved"]').hidden = !saved;
+  box.querySelector('[data-role="saved-name"]').textContent = data.login || '';
+  const form = box.querySelector('[data-role="form"]');
+  if (editing && form.hidden && !saved) box.querySelector('[data-role="login-input"]').value = data.login || '';
+  form.hidden = !editing;
+  box.querySelector('[data-role="change"]').textContent = saved && editing ? 'Отмена' : 'Сменить';
+  btn.disabled = running;
+  btn.textContent = editing ? 'Сохранить и войти' : (data.session === 'active' ? 'Войти заново' : 'Войти');
   msg.className = 'msg info';
+  box.querySelector('[data-role="shot-btn"]').hidden = true;
   if (running) {
-    msg.textContent = 'Открыто окно Webitel — если спросят код подтверждения, введите его там. Окно закроется само.';
+    msg.textContent = 'Вхожу в Webitel...';
   } else if (data.job && data.job.state === 'failed') {
     msg.className = 'msg error';
     msg.textContent = 'Вход не удался: ' + data.job.error;
+    box.querySelector('[data-role="shot-btn"]').hidden = false;
   } else if (data.session === 'expired') {
     msg.textContent = 'Сохранённая сессия истекла — нажмите «Войти».';
   } else if (data.session === 'error') {
@@ -956,12 +1019,55 @@ async function pollWebitelLogin(city) {
 
 WEBITEL_CITIES.forEach(city => {
   const box = document.querySelector(`.webitel-city[data-city="${city}"]`);
+  const msg = box.querySelector('[data-role="msg"]');
+  const loginInput = box.querySelector('[data-role="login-input"]');
+  const passwordInput = box.querySelector('[data-role="password-input"]');
+
   box.querySelector('[data-role="login-btn"]').addEventListener('click', async () => {
-    const msg = box.querySelector('[data-role="msg"]');
     try {
+      if (!box.querySelector('[data-role="form"]').hidden) {
+        // Typed credentials are remembered for this city, then used right away.
+        await api('/api/webitel/credentials/save', {city, login: loginInput.value.trim(), password: passwordInput.value});
+        passwordInput.value = '';
+        webitelEditing[city] = false;
+      }
       await api('/api/webitel/login', {city});
       await refreshWebitelCity(city);
       pollWebitelLogin(city);
+    } catch (e) {
+      msg.className = 'msg error';
+      msg.textContent = e.message;
+    }
+  });
+
+  box.querySelector('[data-role="shot-btn"]').addEventListener('click', async () => {
+    const img = box.querySelector('[data-role="shot"]');
+    if (!img.hidden) { img.hidden = true; return; }
+    try {
+      const data = await api('/api/webitel/login/screenshot', {city});
+      img.src = 'data:image/png;base64,' + data.png;
+      img.hidden = false;
+    } catch (e) {
+      msg.className = 'msg error';
+      msg.textContent = e.message;
+    }
+  });
+
+  box.querySelector('[data-role="change"]').addEventListener('click', () => {
+    webitelEditing[city] = !webitelEditing[city];
+    loginInput.value = '';
+    passwordInput.value = '';
+    if (webitelLast[city]) renderWebitelCity(city, webitelLast[city]);
+    if (webitelEditing[city]) loginInput.focus();
+  });
+
+  box.querySelector('[data-role="forget"]').addEventListener('click', async () => {
+    const login = (webitelLast[city] || {}).login || '';
+    if (!confirm(`Удалить сохранённый вход ${login} для Webitel ${WEBITEL_CITY_NAMES[city]}? Логин, пароль и сохранённая сессия этого города сотрутся с этого компьютера.`)) return;
+    try {
+      await api('/api/webitel/credentials/forget', {city});
+      webitelEditing[city] = false;
+      await refreshWebitelCity(city);
     } catch (e) {
       msg.className = 'msg error';
       msg.textContent = e.message;
@@ -980,6 +1086,31 @@ const loginFormEl = document.getElementById('loginForm');
 let savedCrmLogin = '';
 let polling = false;
 
+let crmLoginState = 'idle';
+let lastAutoLogin = 0;
+
+// Re-login with the remembered account, but never more than once a minute —
+// a wrong saved password must not turn into a login loop.
+function autoRelogin() {
+  if (!savedCrmLogin || Date.now() - lastAutoLogin < 60000) return false;
+  lastAutoLogin = Date.now();
+  setTimeout(() => startCrmLogin({}), 0);
+  return true;
+}
+
+// A CRM action came back with crm_session_expired: reflect it and, with a
+// remembered login, log in again straight away.
+function crmSessionExpired(e) {
+  if (!(e && e.data && e.data.crm_session_expired)) return false;
+  if (crmLoginState === 'ready' || crmLoginState === 'idle') {
+    setLoginState('idle');
+    loginMsgEl.className = 'msg error';
+    loginMsgEl.textContent = 'Сессия CRM истекла.';
+    autoRelogin();
+  }
+  return true;
+}
+
 function setLoginState(state) {
   const states = {
     idle: ['не выполнен', 'pill neutral', '', 'CRM: не выполнен вход'],
@@ -989,6 +1120,8 @@ function setLoginState(state) {
     unconfirmed: ['не подтверждено', 'pill warn', 'warn', 'CRM: вход не подтверждён'],
     code: ['нужен код', 'pill warn', 'warn', 'CRM: нужен код подтверждения'],
   };
+  crmLoginState = state;
+  document.getElementById('crmCodeBanner').hidden = state !== 'code';
   const [text, pillClass, dotClass, title] = states[state];
   loginStatusEl.textContent = text;
   loginStatusEl.className = pillClass;
@@ -1078,6 +1211,11 @@ function showCrmCodeBox(show) {
   }
 }
 
+// After a code is sent the CRM keeps its code page up for a moment while it
+// checks the code; the poll must not read that as "code needed again".
+const CODE_GRACE_MS = 20000;
+let codeSubmittedAt = 0;
+
 async function submitCrmCode() {
   const code = crmCodeInput.value.trim();
   if (!code) return;
@@ -1085,6 +1223,7 @@ async function submitCrmCode() {
   btn.disabled = true;
   try {
     await api('/api/crm/login/code', {code});
+    codeSubmittedAt = Date.now();
     crmCodeInput.value = '';
     crmCodeBox.hidden = true;
     setLoginState('waiting');
@@ -1101,6 +1240,13 @@ async function submitCrmCode() {
 
 document.getElementById('btnCrmCode').addEventListener('click', submitCrmCode);
 crmCodeInput.addEventListener('keydown', e => { if (e.key === 'Enter') submitCrmCode(); });
+// The code is always 6 digits: keep only digits (so a pasted "123 456" works)
+// and confirm by itself once all six are in.
+crmCodeInput.addEventListener('input', () => {
+  const digits = crmCodeInput.value.replace(/[^0-9]/g, '').slice(0, 6);
+  if (crmCodeInput.value !== digits) crmCodeInput.value = digits;
+  if (digits.length === 6) submitCrmCode();
+});
 
 document.getElementById('btnCrmScreenshot').addEventListener('click', async () => {
   const img = document.getElementById('crmScreenshot');
@@ -1115,6 +1261,21 @@ document.getElementById('btnCrmScreenshot').addEventListener('click', async () =
   }
 });
 
+document.getElementById('btnGoToCode').addEventListener('click', () => {
+  document.querySelector('.nav-account-btn').click();
+  crmCodeInput.focus();
+});
+
+// While the console shows "вход выполнен", check once a minute that the CRM
+// still agrees, so an expired session isn't discovered only on the next click.
+setInterval(async () => {
+  if (crmLoginState !== 'ready') return;
+  try {
+    const data = await api('/api/crm/login/status', {});
+    if (!data.ready) crmSessionExpired({data: {crm_session_expired: true}});
+  } catch (e) { /* next tick */ }
+}, 60000);
+
 async function pollLoginStatus() {
   if (polling) return;
   polling = true;
@@ -1124,6 +1285,7 @@ async function pollLoginStatus() {
       try {
         const data = await api('/api/crm/login/status', {});
         if (data.ready) {
+          codeSubmittedAt = 0;
           setLoginState('ready');
           loginMsgEl.className = 'msg info';
           loginMsgEl.textContent = '';
@@ -1138,9 +1300,26 @@ async function pollLoginStatus() {
           loginMsgEl.textContent = 'Вход прервался — нажмите «Войти в CRM».';
           return;
         }
+        const checkingCode = Date.now() - codeSubmittedAt < CODE_GRACE_MS;
+        if (checkingCode && !data.error_text) {
+          continue;  // still verifying the code just sent
+        }
+        if (data.logged_out) {
+          showCrmCodeBox(false);
+          setLoginState('idle');
+          loginMsgEl.className = 'msg error';
+          loginMsgEl.textContent = autoRelogin() ? 'Сессия CRM истекла — вхожу заново...' : 'Нужно войти в CRM — нажмите «Войти в CRM».';
+          return;
+        }
         document.getElementById('btnCrmScreenshot').hidden = false;
         showCrmCodeBox(data.code_required);
-        if (data.code_required) setLoginState('code');
+        if (data.code_required) {
+          setLoginState('code');
+          if (codeSubmittedAt && !data.error_text) {
+            loginMsgEl.className = 'msg error';
+            loginMsgEl.textContent = 'Код не подошёл или устарел — введите новый из приложения.';
+          }
+        }
         if (data.error_text) {
           loginMsgEl.className = 'msg error';
           loginMsgEl.textContent = data.error_text;
@@ -1205,7 +1384,7 @@ document.getElementById('btnPendingTickets').addEventListener('click', async () 
     });
   } catch (e) {
     msgEl.className = 'msg error';
-    msgEl.textContent = 'Ошибка: ' + e.message;
+    msgEl.textContent = crmSessionExpired(e) ? 'Сессия CRM истекла — вхожу заново. Если CRM спросит код, введите его в «Вход и настройки», затем повторите.' : 'Ошибка: ' + e.message;
   }
 });
 
@@ -1272,7 +1451,7 @@ document.getElementById('btnReadTicket').addEventListener('click', async () => {
     document.getElementById('singleNewLogin').value = data.webitel_logins.length === 1 ? logins : '';
     document.getElementById('singleNewName').value = data.webitel_logins.length === 1 ? (data.employee_full_name || '') : '';
   } catch (e) {
-    msgEl.textContent = 'Ошибка: ' + e.message;
+    msgEl.textContent = crmSessionExpired(e) ? 'Сессия CRM истекла — вхожу заново. Если CRM спросит код, введите его в «Вход и настройки», затем повторите.' : 'Ошибка: ' + e.message;
     msgEl.className = 'msg error';
   }
 });
@@ -1776,7 +1955,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/crm/login/status":
                 session = _get_crm_session()
                 status = {"ready": session.is_logged_in(), "browser_open": session.has_open_page(),
-                          "code_required": False, "error_text": ""}
+                          "code_required": False, "error_text": "", "logged_out": False}
                 if status["browser_open"] and not status["ready"]:
                     status.update(session.login_progress())
                 self._send_json(200, status)
@@ -1841,6 +2020,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(200, _webitel_session_state(city))
                 return
 
+            if self.path in ("/api/webitel/credentials/save", "/api/webitel/credentials/forget"):
+                city = str(body.get("city", "")).strip()
+                if city not in WEBITEL_STORAGE_STATE_PATHS:
+                    self._send_json(400, {"error": f"Unknown city {city!r}"})
+                    return
+                if self.path.endswith("/forget"):
+                    _forget_webitel_credentials(city)
+                    self._send_json(200, {"forgotten": True})
+                    return
+                try:
+                    _save_webitel_credentials(city, str(body.get("login") or "").strip(), str(body.get("password") or ""))
+                except ValueError as exc:
+                    self._send_json(400, {"error": str(exc)})
+                    return
+                self._send_json(200, {"saved": True})
+                return
+
+            if self.path == "/api/webitel/login/screenshot":
+                city = str(body.get("city", "")).strip()
+                if city not in WEBITEL_STORAGE_STATE_PATHS:
+                    self._send_json(400, {"error": f"Unknown city {city!r}"})
+                    return
+                png = latest_screenshot(WEBITEL_STORAGE_STATE_PATHS[city], city)
+                if png is None:
+                    self._send_json(404, {"error": "Снимков входа в Webitel ещё нет"})
+                    return
+                self._send_json(200, {"png": base64.b64encode(png).decode("ascii")})
+                return
+
             if self.path == "/api/webitel/login":
                 city = str(body.get("city", "almaty")).strip() or "almaty"
                 if city not in WEBITEL_STORAGE_STATE_PATHS:
@@ -1862,7 +2070,7 @@ class Handler(BaseHTTPRequestHandler):
                 actions = _get_webitel_actions(city)
                 plan = actions.build_plan(template_extension=template_extension, target_extension=target_extension)
                 plan["city"] = city
-                # Off unless the operator ticked "Также сбросить пароль" — execute_plan
+                # Off unless the operator ticked "Сбросить пароль" — execute_plan
                 # only generates a new password when this is True.
                 plan["reset_password"] = body.get("reset_password") is True
                 self._send_json(200, plan)
@@ -1950,6 +2158,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(404, {"error": "not found"})
+        except CrmSessionExpired as exc:
+            # The page re-logs in by itself on this flag (remembered login).
+            self._send_json(401, {"error": str(exc), "crm_session_expired": True})
         except Exception as exc:  # noqa: BLE001 — surface to the operator's browser, not a crash
             self._send_json(500, {"error": _operator_error_message(exc)})
 

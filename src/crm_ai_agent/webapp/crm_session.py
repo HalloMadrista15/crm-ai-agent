@@ -61,6 +61,35 @@ class CrmSessionError(Exception):
     pass
 
 
+class CrmSessionExpired(CrmSessionError):
+    """The CRM sent the browser back to its login page — the session is gone."""
+
+    def __init__(self, message: str = "Сессия CRM истекла — нужно войти заново") -> None:
+        super().__init__(message)
+
+
+# How often an idle console pings the CRM so the session doesn't time out
+# between operator actions (read-only OData request, see _keep_alive).
+_KEEPALIVE_SECONDS = 240
+
+
+def desktop_user_agent(chrome_version: str) -> str:
+    """Headless Chromium announces itself as "HeadlessChrome", which this CRM
+    flags as an unsupported browser (seen 2026-09-28 on the login page) —
+    present the same UA a normal desktop Chrome of that version sends."""
+    return (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{chrome_version} Safari/537.36"
+    )
+
+
+def _on_login_page(page: Any) -> bool:
+    try:
+        return "/login/" in str(page.evaluate("location.href")).lower()
+    except Exception:
+        return False
+
+
 def _visa_owner_filter(owner_ids: list[str]) -> str:
     """OData filter matching approvals owned by any of ``owner_ids``.
 
@@ -180,12 +209,29 @@ class CrmSessionManager:
         with sync_playwright() as p:
             self._playwright = p
             while True:
-                func, result_q = self._queue.get()
+                try:
+                    func, result_q = self._queue.get(timeout=_KEEPALIVE_SECONDS)
+                except queue.Empty:
+                    self._keep_alive()
+                    continue
                 try:
                     result = func(self)
                     result_q.put(("ok", result))
                 except Exception as exc:  # noqa: BLE001 — reported to the caller, not crashed here
                     result_q.put(("error", exc))
+
+    def _keep_alive(self) -> None:
+        """Runs on this thread when no work arrived for _KEEPALIVE_SECONDS: one
+        read-only request so an idle but logged-in session doesn't expire."""
+        page = self._page
+        if page is None:
+            return
+        try:
+            if page.is_closed() or _on_login_page(page):
+                return
+            page.evaluate("() => fetch('/0/odata/BnzVwApproval?$top=1', {credentials: 'include'}).then(() => true, () => false)")
+        except Exception:
+            pass
 
     def _submit(self, func: Callable[["CrmSessionManager"], Any], timeout: float = 60.0) -> Any:
         result_q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
@@ -222,7 +268,7 @@ class CrmSessionManager:
                 except Exception:
                     pass
             mgr._browser = mgr._playwright.chromium.launch(headless=not mgr._show_browser)
-            context = mgr._browser.new_context()
+            context = mgr._browser.new_context(user_agent=desktop_user_agent(mgr._browser.version))
             mgr._page = context.new_page()
             page = mgr._page
 
@@ -260,25 +306,27 @@ class CrmSessionManager:
 
         def _do(mgr: "CrmSessionManager") -> dict[str, Any]:
             if mgr._page is None or mgr._page.is_closed():
-                return {"code_required": False, "error_text": ""}
+                return {"code_required": False, "error_text": "", "logged_out": False}
             try:
                 return mgr._page.evaluate(
                     r"""() => {
-                        if (!location.href.toLowerCase().includes('/login/')) return {code_required: false, error_text: ''};
+                        if (!location.href.toLowerCase().includes('/login/')) return {code_required: false, error_text: '', logged_out: false};
                         const text = document.body ? document.body.innerText : '';
                         const otherInputs = [...document.querySelectorAll('input')].filter(i =>
                             i.offsetParent !== null && !['loginEdit-el', 'passwordEdit-el'].includes(i.id)
                             && !['hidden', 'checkbox', 'radio', 'submit', 'button'].includes(i.type));
                         const errorLine = text.split('\n').map(l => l.trim())
                             .find(l => l.length < 200 && /неверн|ошибк|недействит|invalid|incorrect|expired|истек/i.test(l)) || '';
-                        return {
-                            code_required: /код подтверждения|verification code|one-time code/i.test(text) && otherInputs.length > 0,
-                            error_text: errorLine,
-                        };
+                        const codeRequired = /код подтверждения|verification code|one-time code/i.test(text) && otherInputs.length > 0;
+                        // An empty, visible login form (start_login always fills it) means
+                        // the CRM logged this browser out rather than a login in progress.
+                        const userField = document.getElementById('loginEdit-el');
+                        const loggedOut = !codeRequired && !!userField && userField.offsetParent !== null && !userField.value;
+                        return {code_required: codeRequired, error_text: errorLine, logged_out: loggedOut};
                     }"""
                 )
             except Exception:
-                return {"code_required": False, "error_text": ""}
+                return {"code_required": False, "error_text": "", "logged_out": False}
 
         return self._submit(_do, timeout=10.0)
 
@@ -515,6 +563,8 @@ class CrmSessionManager:
         def _do(mgr: "CrmSessionManager") -> list[dict[str, str]]:
             if mgr._page is None:
                 raise CrmSessionError("Not logged in — click 'Войти в CRM' first")
+            if _on_login_page(mgr._page):
+                raise CrmSessionExpired()
             owner_ids = [visa_owner_id] if visa_owner_id else _own_visa_owner_ids(mgr._page)
             odata_url = (
                 f"{mgr._base_url}/0/odata/BnzVwApproval"
@@ -530,6 +580,8 @@ class CrmSessionManager:
                 }""",
                 odata_url,
             )
+            if result["status"] in (401, 403) or result["body"].lstrip().startswith("<"):
+                raise CrmSessionExpired()
             if result["status"] != 200:
                 raise CrmSessionError(f"CRM OData request failed: HTTP {result['status']} — {result['body'][:500]}")
             rows = json.loads(result["body"]).get("value", [])
@@ -564,6 +616,8 @@ class CrmSessionManager:
                 pass
             page.wait_for_timeout(4000)
 
+            if _on_login_page(page):
+                raise CrmSessionExpired()
             status = _read_field_value(page, "TsiOfficeNoteState")
             if not status:
                 raise CrmSessionError(
