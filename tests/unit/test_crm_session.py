@@ -107,6 +107,16 @@ class TestCrmSessionManager(unittest.TestCase):
         self.mgr._page = None
         self.assertFalse(self.mgr.is_logged_in())
 
+    def test_close_ends_the_manager_for_good(self) -> None:
+        # Its own manager: closing the shared one would break the other tests.
+        mgr = CrmSessionManager(base_url="https://example.invalid")
+        mgr.close()
+        mgr._thread.join(timeout=15)
+        self.assertFalse(mgr._thread.is_alive())
+        with self.assertRaises(CrmSessionError):
+            mgr.has_open_page()
+        mgr.close()  # closing twice is harmless
+
     def test_is_logged_in_false_when_data_query_rejected(self) -> None:
         # Off the login URL, but the real OData query doesn't return 200.
         self.mgr._page = _FakePage(url="https://crm.astana-motors.kz/0/Nui/ViewModule.aspx", evaluate_result=302)

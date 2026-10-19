@@ -9,9 +9,12 @@ import unittest
 from io import BytesIO
 from unittest.mock import patch
 
-from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions, WebitelApiError
+from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions, WebitelApiError, generate_password
 from crm_ai_agent.adapters.webitel_api.session import WebitelApiSession
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
+
+# 16 letters/digits, never 0, o or O.
+_PASSWORD_FORMAT = r"^[1-9A-NP-Za-np-z]{16}$"
 
 SESSION = WebitelApiSession(cookie_header="WBTLAUTH=fake; WBTLCSRF=fake", access_token="fake-token")
 
@@ -161,6 +164,170 @@ class TestBuildPlan(unittest.TestCase):
             self.assertEqual(request.get_method(), "GET")
 
 
+def _user_lookups() -> list[_FakeResponse]:
+    """Template 10078 then target 10079, as build_plan looks them up."""
+    return [
+        _FakeResponse({"items": [{"id": "1138", "extension": "10078"}]}),
+        _FakeResponse(TEMPLATE_USER),
+        _FakeResponse({"items": [{"id": "9999", "extension": "10079"}]}),
+        _FakeResponse(TARGET_USER),
+    ]
+
+
+def _grant(grantee_id: str, name: str, granted: str, *, person: bool = False) -> dict:
+    grantee = {"id": grantee_id, "name": name, **({"user": True} if person else {})}
+    return {"grantee": grantee, "granted": granted}
+
+
+class TestBuildPlanWithPermissions(unittest.TestCase):
+    """Shapes from the real GET /api/users/{id}/acl (2026-10-16)."""
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_lists_template_role_grants_the_target_lacks(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _user_lookups() + [
+            # target's current permissions
+            _FakeResponse({"page": 1, "items": [
+                _grant("1138", "madi muratbay", "xrwdxrwd", person=True),
+                _grant("2401", "semiadmin", "rw"),
+                _grant("4995", "practice", "r"),
+            ]}),
+            # template's, over two pages
+            _FakeResponse({"page": 1, "next": True, "items": [
+                _grant("2", "adm", "xrwdxrwd", person=True),
+                _grant("2401", "semiadmin", "rw"),
+            ]}),
+            _FakeResponse({"page": 2, "items": [
+                _grant("4995", "practice", "rw"),
+                _grant("6143", "user-alm-aic-301", "r"),
+            ]}),
+        ]
+
+        plan = _actions().build_plan(template_extension="10078", target_extension="10079", copy_permissions=True)
+
+        self.assertIs(plan["copy_permissions"], True)
+        # semiadmin is already the same, adm is a person — neither is copied.
+        self.assertEqual(plan["permissions"], [
+            {"grantee": "4995", "name": "practice", "granted": "rw", "current": "r"},
+            {"grantee": "6143", "name": "user-alm-aic-301", "granted": "r", "current": ""},
+        ])
+        urls = [call.args[0].full_url for call in mock_urlopen.call_args_list[4:]]
+        self.assertEqual(urls, [
+            "https://wtl-alm.astana-motors.kz/api/users/9999/acl?page=1&size=100",
+            "https://wtl-alm.astana-motors.kz/api/users/1138/acl?page=1&size=100",
+            "https://wtl-alm.astana-motors.kz/api/users/1138/acl?page=2&size=100",
+        ])
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_without_the_checkbox_permissions_are_not_read(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = _user_lookups()
+        plan = _actions().build_plan(template_extension="10078", target_extension="10079")
+        self.assertNotIn("permissions", plan)
+        self.assertEqual(mock_urlopen.call_count, 4)
+
+
+def _acl(*grants: dict) -> _FakeResponse:
+    return _FakeResponse({"page": 1, "items": list(grants)})
+
+
+def _patches(mock_urlopen) -> list:
+    """(url, body) of every PATCH sent, in order."""
+    return [
+        (c.args[0].full_url, json.loads(c.args[0].data))
+        for c in mock_urlopen.call_args_list
+        if c.args[0].get_method() == "PATCH"
+    ]
+
+
+ACL_URL = "https://wtl-alm.astana-motors.kz/api/users/9999/acl"
+
+
+class TestExecutePlanWithPermissions(unittest.TestCase):
+    """Webitel's ACL PATCH flips the letters it names (confirmed 2026-10-18
+    on test user 30120): "r"+"w" -> "rw", "rw"+"rw" -> grantee gone."""
+
+    PLAN = {
+        "target_id": "9999", "roles": [], "license": [], "group": "x", "copy_permissions": True,
+        "permissions": [
+            {"grantee": "4995", "name": "practice", "granted": "rw", "current": "r"},
+            {"grantee": "6143", "name": "user-alm-aic-301", "granted": "r", "current": ""},
+        ],
+    }
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_missing_grantee_is_sent_once_and_a_different_one_is_cleared_first(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(TARGET_USER), _FakeResponse({"id": "9999"}),
+            _acl(_grant("4995", "practice", "r")),  # what the target has now
+            _FakeResponse({}), _FakeResponse({}), _FakeResponse({}),
+            _acl(_grant("4995", "practice", "rw"), _grant("6143", "user-alm-aic-301", "r")),  # read back
+        ]
+
+        result = _actions().execute_plan(self.PLAN)
+
+        self.assertEqual(_patches(mock_urlopen), [
+            (ACL_URL, [{"grantee": 4995, "grants": "r"}]),   # clear practice's "r"...
+            (ACL_URL, [{"grantee": 4995, "grants": "rw"}]),  # ...then give it "rw"
+            (ACL_URL, [{"grantee": 6143, "grants": "r"}]),
+        ])
+        self.assertEqual(result["permissions_copied"], 2)
+        self.assertNotIn("permissions_error", result)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_grantee_that_already_matches_is_never_sent(self, mock_urlopen) -> None:
+        """Sending it again would flip it off — what happened to a new
+        user's default semiadmin/practice in the first version."""
+        both = (_grant("4995", "practice", "rw"), _grant("6143", "user-alm-aic-301", "r"))
+        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({"id": "9999"}), _acl(*both), _acl(*both)]
+
+        result = _actions().execute_plan(self.PLAN)
+
+        self.assertEqual(_patches(mock_urlopen), [])
+        self.assertEqual(result["permissions_copied"], 2)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_grant_webitel_silently_drops_is_reported(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(TARGET_USER), _FakeResponse({"id": "9999"}),
+            _acl(),
+            _FakeResponse({}), _FakeResponse({}),
+            _acl(_grant("6143", "user-alm-aic-301", "r")),
+        ]
+
+        result = _actions().execute_plan(self.PLAN)
+
+        self.assertIn("practice (rw)", result["permissions_error"])
+        self.assertNotIn("user-alm-aic-301", result["permissions_error"])
+        self.assertEqual(result["permissions_copied"], 1)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_failed_permissions_patch_keeps_the_new_password(self, mock_urlopen) -> None:
+        import urllib.error
+
+        mock_urlopen.side_effect = [
+            _FakeResponse(TARGET_USER),
+            _FakeResponse({"id": "9999"}),
+            _acl(),
+            urllib.error.HTTPError(url="x", code=403, msg="Forbidden", hdrs=None, fp=BytesIO(b"no acl rights")),
+            _FakeResponse({}),
+            _acl(_grant("6143", "user-alm-aic-301", "r")),
+        ]
+
+        result = _actions().execute_plan({**self.PLAN, "reset_password": True})
+
+        self.assertRegex(result["new_password"], _PASSWORD_FORMAT)
+        self.assertIn("practice (rw)", result["permissions_error"])
+        self.assertIn("HTTP 403", result["permissions_error"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_nothing_to_copy_sends_no_patch(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({"id": "9999"})]
+        result = _actions().execute_plan({**self.PLAN, "permissions": []})
+        self.assertEqual(mock_urlopen.call_count, 2)
+        self.assertNotIn("permissions_copied", result)
+
+
 class TestExecutePlan(unittest.TestCase):
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_execute_refetches_target_and_puts_merged_record(self, mock_urlopen) -> None:
@@ -245,8 +412,7 @@ class TestExecutePlan(unittest.TestCase):
 
         put_request = mock_urlopen.call_args_list[1].args[0]
         sent_body = json.loads(put_request.data)
-        self.assertIn("password", sent_body)
-        self.assertTrue(len(sent_body["password"]) > 0)
+        self.assertRegex(sent_body["password"], _PASSWORD_FORMAT)
         self.assertEqual(result["new_password"], sent_body["password"])
 
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
@@ -261,6 +427,25 @@ class TestExecutePlan(unittest.TestCase):
         result2 = _actions().execute_plan(plan)
 
         self.assertNotEqual(result1["new_password"], result2["new_password"])
+
+
+class TestGeneratePassword(unittest.TestCase):
+    def test_only_letters_and_digits_without_zero_or_letter_o(self) -> None:
+        for _ in range(2000):
+            password = generate_password()
+            self.assertRegex(password, _PASSWORD_FORMAT)
+            self.assertTrue(any(c.isupper() for c in password), password)
+            self.assertTrue(any(c.islower() for c in password), password)
+            self.assertTrue(any(c.isdigit() for c in password), password)
+
+    def test_every_allowed_character_turns_up(self) -> None:
+        # Guards against an alphabet that's narrower than intended.
+        seen = set("".join(generate_password() for _ in range(500)))
+        expected = set("123456789ABCDEFGHIJKLMNPQRSTUVWXYZabcdefghijklmnpqrstuvwxyz")
+        self.assertEqual(seen, expected)
+
+    def test_length_can_be_chosen(self) -> None:
+        self.assertEqual(len(generate_password(10)), 10)
 
 
 class TestFindNeighbors(unittest.TestCase):
@@ -343,6 +528,94 @@ class TestBuildCreatePlan(unittest.TestCase):
             self.assertEqual(call.args[0].get_method(), "GET")
 
 
+class TestCreateWithPermissions(unittest.TestCase):
+    PLAN = {
+        "new_username": "10087", "new_name": "New Person", "new_extension": "10087",
+        "roles": [], "license": [], "group": "", "copy_permissions": True,
+        "permissions": [{"grantee": "6143", "name": "user-alm-aic-301", "granted": "r", "current": ""}],
+    }
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_plan_lists_every_template_role_grant(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": [{"id": "1138", "extension": "10078"}]}),
+            _FakeResponse(TEMPLATE_USER),
+            _FakeResponse({"items": []}),  # new extension is free
+            _FakeResponse({"page": 1, "items": [
+                _grant("2", "adm", "xrwdxrwd", person=True),
+                _grant("2401", "semiadmin", "rw"),
+                _grant("6143", "user-alm-aic-301", "r"),
+            ]}),
+        ]
+        plan = _actions().build_create_plan(
+            template_extension="10078", new_username="10087", new_name="New Person", new_extension="10087",
+            copy_permissions=True,
+        )
+        self.assertEqual(plan["permissions"], [
+            {"grantee": "2401", "name": "semiadmin", "granted": "rw", "current": ""},
+            {"grantee": "6143", "name": "user-alm-aic-301", "granted": "r", "current": ""},
+        ])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_new_user_gets_the_planned_permissions_last(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse({"id": "5555"}),  # POST /api/users
+            _FakeResponse({"id": "device-1"}),  # POST /api/devices
+            _FakeResponse({"id": "5555"}),  # GET refetch, no devices -> no PUT
+            _acl(),  # the new user's permissions before
+            _FakeResponse({}),  # PATCH acl
+            _acl(_grant("6143", "user-alm-aic-301", "r")),  # read back
+        ]
+        result = _actions().execute_create_plan(self.PLAN)
+
+        self.assertEqual(_patches(mock_urlopen),
+                         [("https://wtl-alm.astana-motors.kz/api/users/5555/acl", [{"grantee": 6143, "grants": "r"}])])
+        self.assertEqual(result["permissions_copied"], 1)
+        self.assertRegex(result["temporary_password"], _PASSWORD_FORMAT)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_roles_webitel_gave_the_new_user_by_default_are_left_alone(self, mock_urlopen) -> None:
+        """2026-10-18: the first version re-sent a new user's default
+        semiadmin/practice and so took them away (the PATCH flips)."""
+        plan = {**self.PLAN, "permissions": [
+            {"grantee": "2401", "name": "semiadmin", "granted": "rw", "current": ""},
+            {"grantee": "6143", "name": "user-alm-aic-301", "granted": "r", "current": ""},
+        ]}
+        mock_urlopen.side_effect = [
+            _FakeResponse({"id": "5555"}), _FakeResponse({"id": "device-1"}), _FakeResponse({"id": "5555"}),
+            _acl(_grant("2401", "semiadmin", "rw")),  # Webitel's default
+            _FakeResponse({}),
+            _acl(_grant("2401", "semiadmin", "rw"), _grant("6143", "user-alm-aic-301", "r")),
+        ]
+        result = _actions().execute_create_plan(plan)
+
+        self.assertEqual([body for _, body in _patches(mock_urlopen)], [[{"grantee": 6143, "grants": "r"}]])
+        self.assertEqual(result["permissions_copied"], 2)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_failed_permissions_patch_keeps_the_temporary_password(self, mock_urlopen) -> None:
+        import urllib.error
+
+        mock_urlopen.side_effect = [
+            _FakeResponse({"id": "5555"}),
+            _FakeResponse({"id": "device-1"}),
+            _FakeResponse({"id": "5555"}),
+            _acl(),
+            urllib.error.HTTPError(url="x", code=403, msg="Forbidden", hdrs=None, fp=BytesIO(b"no acl rights")),
+            _acl(),  # read back: nothing set
+        ]
+        result = _actions().execute_create_plan(self.PLAN)
+        self.assertRegex(result["temporary_password"], _PASSWORD_FORMAT)
+        self.assertIn("HTTP 403", result["permissions_error"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_without_the_checkbox_no_patch(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [_FakeResponse({"id": "5555"}), _FakeResponse({"id": "device-1"}), _FakeResponse({"id": "5555"})]
+        result = _actions().execute_create_plan({**self.PLAN, "copy_permissions": False})
+        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertNotIn("permissions_copied", result)
+
+
 class TestExecuteCreatePlan(unittest.TestCase):
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_posts_new_user_with_cloned_roles_license_group(self, mock_urlopen) -> None:
@@ -373,8 +646,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
         self.assertEqual(sent_body["license"], TEMPLATE_USER["license"])
         self.assertEqual(sent_body["profile"]["group"], "7719499780")
         self.assertFalse(sent_body["force_password_change"])
-        self.assertIn("password", sent_body)
-        self.assertTrue(len(sent_body["password"]) > 0)
+        self.assertRegex(sent_body["password"], _PASSWORD_FORMAT)
 
         # The generated password is returned to the caller (so it can be
         # shown to the approver once) but is a fresh random value, never a

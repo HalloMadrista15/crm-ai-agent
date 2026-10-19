@@ -13,20 +13,36 @@ together everything already built:
   entire project that changes anything in Webitel, and only reachable
   through the UI's explicit two-step "show plan, then confirm" flow.
 
-Runs only on localhost, only for the one operator running it on their own
-machine (see docs/open_questions.md's "Обновление после реальной
+By default it runs only on localhost, for the one operator running it on
+their own machine (see docs/open_questions.md's "Обновление после реальной
 разведки" — Telegram/multi-user approval was explicitly dropped in favor
-of this). Nothing here is meant to be exposed beyond 127.0.0.1.
+of this). With CONSOLE_SHARED=1 in info.env it is a shared console on a
+server instead (2026-10-07): it looks and works the same, but every
+browser gets its own workspace (a cookie) with its own CRM browser, saved
+logins and Webitel sessions under operators/<id>/, so colleagues never act
+under each other's accounts. run() refuses to listen beyond loopback
+unless the console is shared and served over HTTPS.
 """
 
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 import re
+import secrets
+import ssl
+import sys
+import threading
+import time
+import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from crm_ai_agent.webapp.crm_session import CrmSessionExpired, CrmSessionManager
 from crm_ai_agent.webapp.webitel_login import WEBITEL_CITY_KEYS, WebitelLoginJob, city_config, latest_screenshot
@@ -37,6 +53,9 @@ WEBITEL_STORAGE_STATE_PATHS = {
     "almaty": ROOT / ".auth" / "webitel_almaty_storage_state.json",
     "astana": ROOT / ".auth" / "webitel_astana_storage_state.json",
 }
+# Shared console only: each operator's own logins and Webitel sessions.
+OPERATORS_DIR = ROOT / "operators"
+AUDIT_LOG_PATH = ROOT / "audit" / "console_actions.jsonl"
 
 
 _SETTINGS_KEYS = (
@@ -65,32 +84,73 @@ def _save_env_updates(path: Path, updates: dict[str, str]) -> None:
             continue
         if value:
             existing[key] = value
-    lines = [f"{k}={v}" for k, v in existing.items()]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_env(path, existing)
 
 
 def _remove_env_keys(path: Path, keys: tuple[str, ...]) -> None:
     existing = _load_env_file(path)
     if not any(key in existing for key in keys):
         return
-    lines = [f"{k}={v}" for k, v in existing.items() if k not in keys]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _write_env(path, {k: v for k, v in existing.items() if k not in keys})
+
+
+def _write_env(path: Path, values: dict[str, str]) -> None:
+    """Saved logins are readable by their owner only (a no-op on Windows)."""
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("\n".join(f"{k}={v}" for k, v in values.items()) + "\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+@dataclass
+class _Operator:
+    """Whose saved logins, Webitel sessions and CRM browser a request uses.
+    ``name`` is the browser's workspace id on a shared console and "" for the
+    one operator of a local console, whose files stay info.env and .auth/."""
+
+    name: str
+    env_path: Path
+    storage_paths: dict[str, Path]
+
+
+def _local_operator() -> _Operator:
+    return _Operator("", INFO_ENV_PATH, dict(WEBITEL_STORAGE_STATE_PATHS))
+
+
+def _named_operator(name: str) -> _Operator:
+    home = OPERATORS_DIR / name
+    return _Operator(
+        name,
+        home / "info.env",
+        {city: home / ".auth" / f"webitel_{city}_storage_state.json" for city in WEBITEL_STORAGE_STATE_PATHS},
+    )
+
+
+def _operator_env(op: _Operator) -> dict[str, str]:
+    """The shared settings (addresses, domains) from info.env plus this
+    operator's own logins — never another operator's, nor logins left in the
+    shared info.env from before it became a shared console."""
+    shared = {k: v for k, v in _load_env_file(INFO_ENV_PATH).items() if k not in _SETTINGS_KEYS}
+    own = {k: v for k, v in _load_env_file(op.env_path).items() if k in _SETTINGS_KEYS}
+    return {**shared, **own}
 
 
 _CITY_NAMES = {"almaty": "Алматы", "astana": "Астана"}
 
-# At most one visible-browser Webitel login per city at a time.
-_webitel_login_jobs: dict[str, WebitelLoginJob] = {}
+# At most one Webitel login per operator and city at a time.
+_webitel_login_jobs: dict[tuple[str, str], WebitelLoginJob] = {}
 
 
-def _webitel_session_state(city: str) -> dict[str, Any]:
+def _webitel_session_state(op: _Operator, city: str) -> dict[str, Any]:
     """Who the console logs into this city's Webitel as, and whether the
     saved session still works (one read-only request)."""
-    from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions, WebitelApiError
+    from crm_ai_agent.adapters.webitel_api.actions import WebitelApiError
     from crm_ai_agent.adapters.webitel_api.session import WebitelSessionError
 
-    config = city_config(_load_env_file(INFO_ENV_PATH), city)
-    job = _webitel_login_jobs.get(city)
+    config = city_config(_operator_env(op), city)
+    job = _webitel_login_jobs.get((op.name, city))
     state: dict[str, Any] = {
         "city": city,
         "login": config["login"],
@@ -102,7 +162,7 @@ def _webitel_session_state(city: str) -> dict[str, Any]:
         state["session"] = "missing"
         return state
     try:
-        WebitelApiActions.from_info_env(INFO_ENV_PATH, WEBITEL_STORAGE_STATE_PATHS[city], city=city).check_session()
+        _get_webitel_actions(op, city).check_session()
         state["session"] = "active"
     except WebitelSessionError:
         state["session"] = "missing"
@@ -112,40 +172,41 @@ def _webitel_session_state(city: str) -> dict[str, Any]:
     return state
 
 
-def _save_webitel_credentials(city: str, login: str, password: str) -> None:
-    """This operator's own Webitel account for one city, into info.env.
+def _save_webitel_credentials(op: _Operator, city: str, login: str, password: str) -> None:
+    """This operator's own Webitel account for one city, into their info.env.
     Raises ValueError with an operator-facing message."""
     if not login or not password:
         raise ValueError("Введите и логин, и пароль Webitel")
     keys = WEBITEL_CITY_KEYS[city]
-    _save_env_updates(INFO_ENV_PATH, {keys["login"]: login, keys["password"]: password})
+    _save_env_updates(op.env_path, {keys["login"]: login, keys["password"]: password})
 
 
-def _forget_webitel_credentials(city: str) -> None:
+def _forget_webitel_credentials(op: _Operator, city: str) -> None:
     """Removes this city's remembered Webitel login/password AND its saved
     session — otherwise the console would keep acting as that account."""
     keys = WEBITEL_CITY_KEYS[city]
-    _remove_env_keys(INFO_ENV_PATH, (keys["login"], keys["password"]))
-    WEBITEL_STORAGE_STATE_PATHS[city].unlink(missing_ok=True)
+    _remove_env_keys(op.env_path, (keys["login"], keys["password"]))
+    op.storage_paths[city].unlink(missing_ok=True)
 
 
-def _start_webitel_login(city: str) -> dict[str, Any]:
+def _start_webitel_login(op: _Operator, city: str) -> dict[str, Any]:
     """Raises ValueError with an operator-facing message when this city's
     login can't start (missing credentials or address)."""
-    config = city_config(_load_env_file(INFO_ENV_PATH), city)
+    env = _operator_env(op)
+    config = city_config(env, city)
     name = _CITY_NAMES.get(city, city)
     if not config["login"] or not config["password"]:
         raise ValueError(f"Впишите логин и пароль Webitel {name} в «Настройках» и нажмите «Сохранить»")
     if not config["base_url"] or not config["domain"]:
         raise ValueError(f"В info.env нет адреса или домена Webitel {name} — см. info.env.example")
-    job = _webitel_login_jobs.get(city)
+    job = _webitel_login_jobs.get((op.name, city))
     if job and job.state == "running":
         return {"started": False, "running": True}
-    _webitel_login_jobs[city] = WebitelLoginJob(
+    _webitel_login_jobs[(op.name, city)] = WebitelLoginJob(
         city=city,
         config=config,
-        storage_state_path=WEBITEL_STORAGE_STATE_PATHS[city],
-        show_browser=_load_env_file(INFO_ENV_PATH).get("WEBITEL_SHOW_BROWSER") == "1",
+        storage_state_path=op.storage_paths[city],
+        show_browser=env.get("WEBITEL_SHOW_BROWSER") == "1",
     )
     return {"started": True, "login": config["login"]}
 
@@ -162,13 +223,18 @@ def _operator_error_message(exc: Exception) -> str:
     return message
 
 
-def _get_webitel_actions(city: str) -> Any:
+def _get_webitel_actions(op: _Operator, city: str) -> Any:
     from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions
+    from crm_ai_agent.adapters.webitel_api.session import load_session
 
-    storage_state_path = WEBITEL_STORAGE_STATE_PATHS.get(city)
+    storage_state_path = op.storage_paths.get(city)
     if storage_state_path is None:
         raise ValueError(f"Unknown city {city!r} — must be one of: {', '.join(WEBITEL_STORAGE_STATE_PATHS)}")
-    return WebitelApiActions.from_info_env(INFO_ENV_PATH, storage_state_path, city=city)
+    key = WEBITEL_CITY_KEYS[city]["base_url"]
+    base_url = _operator_env(op).get(key)
+    if not base_url:
+        raise ValueError(f"Missing {key} in {INFO_ENV_PATH}")
+    return WebitelApiActions(base_url=base_url, session=load_session(storage_state_path))
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -223,21 +289,35 @@ def _extract_webitel_logins(comment: str | None) -> list[str]:
     return logins
 
 
-_crm_session: CrmSessionManager | None = None
+# One persistent CRM browser per operator ("" = the local console's one).
+_crm_sessions: dict[str, CrmSessionManager] = {}
+_crm_sessions_lock = threading.Lock()
 
 
-def _get_crm_session() -> CrmSessionManager:
-    # Credentials are not baked in here: /api/crm/login passes them on every
-    # login (typed in the console or the remembered ones from info.env), so
-    # an operator with nothing saved yet can still log in.
-    global _crm_session
-    if _crm_session is None:
-        env = _load_env_file(INFO_ENV_PATH)
-        base_url = env.get("CRM_BASE_URL")
-        if not base_url:
-            raise RuntimeError("Missing CRM_BASE_URL in info.env")
-        _crm_session = CrmSessionManager(base_url=base_url, show_browser=env.get("CRM_SHOW_BROWSER") == "1")
-    return _crm_session
+def _new_crm_session() -> CrmSessionManager:
+    # Credentials are not baked in here: every login passes them (typed in
+    # the console or the remembered ones), so an operator with nothing saved
+    # yet can still log in.
+    env = _load_env_file(INFO_ENV_PATH)
+    base_url = env.get("CRM_BASE_URL")
+    if not base_url:
+        raise RuntimeError("Missing CRM_BASE_URL in info.env")
+    return CrmSessionManager(base_url=base_url, show_browser=env.get("CRM_SHOW_BROWSER") == "1")
+
+
+def _get_crm_session(op: _Operator | None = None) -> CrmSessionManager:
+    name = op.name if op else ""
+    with _crm_sessions_lock:
+        if name not in _crm_sessions:
+            _crm_sessions[name] = _new_crm_session()
+        return _crm_sessions[name]
+
+
+def _crm_login_of(op: _Operator) -> str:
+    """The CRM account this operator's CRM browser last logged in as."""
+    with _crm_sessions_lock:
+        manager = _crm_sessions.get(op.name)
+    return (manager.login if manager else "") or _load_env_file(op.env_path).get("CRM_LOGIN", "")
 
 
 def _normalize_confirmation_code(raw: Any) -> str:
@@ -249,28 +329,108 @@ def _normalize_confirmation_code(raw: Any) -> str:
     return code
 
 
-def _resolve_crm_login(body: dict[str, Any]) -> tuple[str, str]:
+def _resolve_crm_login(body: dict[str, Any], op: _Operator | None = None) -> tuple[str, str]:
     """Credentials for /api/crm/login: the ones typed into the console if
-    any (saved to info.env only when "remember" is ticked), otherwise the
-    remembered ones. Raises ValueError with an operator-facing message."""
+    any (saved to the operator's info.env only when "remember" is ticked),
+    otherwise the remembered ones. Raises ValueError with an operator-facing
+    message."""
+    op = op or _local_operator()
     login = str(body.get("login") or "").strip()
     password = str(body.get("password") or "")
     if login or password:
         if not login or not password:
             raise ValueError("Введите и логин, и пароль CRM")
         if body.get("remember"):
-            saved_login = _load_env_file(INFO_ENV_PATH).get("CRM_LOGIN", "")
+            saved_login = _load_env_file(op.env_path).get("CRM_LOGIN", "")
             if saved_login and saved_login != login:
                 # The saved Visa Owner ID belonged to the previous account;
                 # dropping it makes the console detect the new one after login.
-                _remove_env_keys(INFO_ENV_PATH, ("CRM_VISA_OWNER_ID",))
-            _save_env_updates(INFO_ENV_PATH, {"CRM_LOGIN": login, "CRM_PASSWORD": password})
+                _remove_env_keys(op.env_path, ("CRM_VISA_OWNER_ID",))
+            _save_env_updates(op.env_path, {"CRM_LOGIN": login, "CRM_PASSWORD": password})
         return login, password
-    env = _load_env_file(INFO_ENV_PATH)
+    env = _load_env_file(op.env_path)
     login, password = env.get("CRM_LOGIN", ""), env.get("CRM_PASSWORD", "")
     if not login or not password:
         raise ValueError("Логин и пароль CRM не сохранены — введите их")
     return login, password
+
+
+# --- Shared console: a workspace per browser, and who changed what ---
+#
+# No sign-in to the console itself: every browser gets its own workspace (a
+# cookie), and inside it logs in to CRM and Webitel exactly as on a local
+# console. Workspaces never see each other's logins, sessions or CRM browser.
+
+_WORKSPACE_COOKIE = "console_workspace"
+_WORKSPACE_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+_WORKSPACE_COOKIE_MAX_AGE = 365 * 24 * 3600
+_WORKSPACE_IDLE_SECONDS = 12 * 3600
+
+# Set by run() from CONSOLE_SHARED; tests flip these directly.
+_SHARED = False
+_TLS_ENABLED = False
+
+# When each workspace last made a request: the CRM browser of one idle for
+# _WORKSPACE_IDLE_SECONDS is closed (its saved logins stay on disk).
+_workspace_seen: dict[str, float] = {}
+_workspaces_lock = threading.Lock()
+
+
+def _workspace_id(token: str) -> str:
+    """The cookie is the key to a browser's saved passwords, so it never
+    appears on disk: the workspace directory is named after its hash."""
+    return hashlib.sha256(token.encode("ascii")).hexdigest()[:32]
+
+
+def _close_later(manager: CrmSessionManager | None) -> None:
+    """Closing a CRM browser can take seconds; never inside a request or a lock."""
+    if manager is not None:
+        threading.Thread(target=manager.close, daemon=True).start()
+
+
+def _sweep_idle_workspaces(now: float) -> None:
+    """Called with _workspaces_lock held."""
+    for workspace, seen in list(_workspace_seen.items()):
+        if now - seen > _WORKSPACE_IDLE_SECONDS:
+            del _workspace_seen[workspace]
+            with _crm_sessions_lock:
+                manager = _crm_sessions.pop(workspace, None)
+            _close_later(manager)
+
+
+def _exposure_problem(host: str, shared: bool, tls: bool) -> str:
+    """Why the console must not listen this way, or "" when it may."""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return ""
+    if not shared:
+        return "CONSOLE_HOST открывает консоль в сеть без CONSOLE_SHARED=1 — все в сети работали бы под одними учётками"
+    if not tls:
+        return "CONSOLE_HOST открывает консоль в сеть без HTTPS — задайте CONSOLE_TLS_CERT и CONSOLE_TLS_KEY"
+    return ""
+
+
+# Only these plan fields go into the audit log — never a plan's or a
+# result's secrets (e.g. the temporary password a reset or create returns).
+_AUDIT_PLAN_FIELDS = (
+    "city", "template_extension", "target_extension", "target_name", "copy_permissions", "permissions",
+    "new_username", "new_name", "new_extension", "extension", "name", "reset_password",
+)
+_audit_lock = threading.Lock()
+
+
+def _audit(op: _Operator, client_ip: str, action: str, details: dict[str, Any]) -> None:
+    """Append-only record of who changed what in Webitel through the console."""
+    entry = {
+        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "workspace": op.name[:8] or "local",
+        "ip": client_ip,
+        "action": action,
+        **details,
+    }
+    with _audit_lock:
+        AUDIT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 _INDEX_HTML = """<!doctype html>
@@ -360,6 +520,7 @@ _INDEX_HTML = """<!doctype html>
   code{background:var(--accent-soft);color:var(--text);border-radius:4px;padding:1px 5px;font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
   .checkbox-row{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-soft);margin-bottom:12px;cursor:pointer;user-select:none;}
   .checkbox-row input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;}
+  .checkbox-line{display:flex;flex-wrap:wrap;gap:0 24px;}
   .list .field.list-error{background:var(--danger-soft);border-color:var(--danger-soft);}
   .list .field.list-error .k{color:var(--danger-dark);}
   .list .field.list-ok .status{color:var(--good);font-weight:700;}
@@ -697,10 +858,16 @@ _INDEX_HTML = """<!doctype html>
             <input type="text" id="targetExt" placeholder="напр. 10079, 10080">
           </div>
         </div>
-        <label class="checkbox-row">
-          <input type="checkbox" id="resetPasswordCheck">
-          Сбросить пароль
-        </label>
+        <div class="checkbox-line">
+          <label class="checkbox-row">
+            <input type="checkbox" id="resetPasswordCheck">
+            Сбросить пароль
+          </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="copyPermissionsCheck">
+            Копировать Permissions
+          </label>
+        </div>
         <div class="row">
           <button id="btnPlan">Показать план</button>
         </div>
@@ -764,7 +931,11 @@ _INDEX_HTML = """<!doctype html>
         <div id="neighborsMsg" class="msg info"></div>
         <div id="neighborsList" class="list"></div>
 
-        <div class="row form-submit">
+        <label class="checkbox-row form-submit">
+          <input type="checkbox" id="singleCopyPermissionsCheck">
+          Копировать Permissions
+        </label>
+        <div class="row">
           <button id="btnCreatePlanSingle">Показать план</button>
         </div>
         </div>
@@ -794,6 +965,10 @@ _INDEX_HTML = """<!doctype html>
             <div class="hint">Формат строки: <code>логин,ФИО</code></div>
           </div>
         </div>
+        <label class="checkbox-row">
+          <input type="checkbox" id="bulkCopyPermissionsCheck">
+          Копировать Permissions
+        </label>
         <div class="row">
           <button id="btnCreatePlan">Показать план для всех</button>
         </div>
@@ -1063,7 +1238,7 @@ WEBITEL_CITIES.forEach(city => {
 
   box.querySelector('[data-role="forget"]').addEventListener('click', async () => {
     const login = (webitelLast[city] || {}).login || '';
-    if (!confirm(`Удалить сохранённый вход ${login} для Webitel ${WEBITEL_CITY_NAMES[city]}? Логин, пароль и сохранённая сессия этого города сотрутся с этого компьютера.`)) return;
+    if (!confirm(`Удалить сохранённый вход ${login} для Webitel ${WEBITEL_CITY_NAMES[city]}? Логин, пароль и сохранённая сессия этого города сотрутся из консоли.`)) return;
     try {
       await api('/api/webitel/credentials/forget', {city});
       webitelEditing[city] = false;
@@ -1148,7 +1323,7 @@ function showSavedLogin(login) {
 }
 
 document.getElementById('btnForgetLogin').addEventListener('click', async () => {
-  if (!confirm(`Удалить сохранённый вход ${savedCrmLogin} с этого компьютера? Логин и пароль CRM (и Visa Owner ID, если был) сотрутся из info.env. Текущий вход продолжит работать, пока открыто окно CRM.`)) return;
+  if (!confirm(`Удалить сохранённый вход ${savedCrmLogin}? Логин и пароль CRM (и Visa Owner ID, если был) сотрутся из консоли. Текущий вход продолжит работать, пока открыто окно CRM.`)) return;
   try {
     await api('/api/crm/credentials/forget', {});
     showSavedLogin('');
@@ -1388,6 +1563,25 @@ document.getElementById('btnPendingTickets').addEventListener('click', async () 
   }
 });
 
+// A Webitel grant string ("r", "rw", "xrwdxrwd") as the Permissions tab names it.
+function grantsLabel(granted) {
+  if (!granted) return 'нет';
+  const parts = [['r', 'Read'], ['w', 'Edit'], ['d', 'Delete']].filter(([letter]) => granted.includes(letter)).map(([, name]) => name);
+  return (parts.join('+') || granted) + (granted.includes('x') ? ' с делегированием' : '');
+}
+
+// A plan's "permissions" (role grants to copy from the template) for display.
+function permissionsText(perms, emptyText) {
+  if (!perms || perms.length === 0) return emptyText;
+  return perms.map(p => `${esc(p.name)} — ${grantsLabel(p.granted)}${p.current ? ' (было ' + grantsLabel(p.current) + ')' : ''}`).join(', ');
+}
+
+// What became of copying permissions, for a result line ('' if not asked).
+function permissionsResultNote(result) {
+  if (result.permissions_error) return ` · права НЕ скопированы: ${esc(result.permissions_error)}`;
+  return result.permissions_copied ? ` · права: скопировано ${result.permissions_copied}` : '';
+}
+
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
 }
@@ -1490,6 +1684,7 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
       const plan = await api('/api/webitel/plan', {
         template_extension, target_extension, city: selectedCity,
         reset_password: document.getElementById('resetPasswordCheck').checked,
+        copy_permissions: document.getElementById('copyPermissionsCheck').checked,
       });
       currentPlans.push({ok: true, plan});
     } catch (e) {
@@ -1504,8 +1699,9 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
       const roleNames = r.plan.roles.map(x => x.name).join(', ') || '—';
       const licenseNames = r.plan.license.map(x => x.prod || x.id).join(', ') || '—';
       const passwordNote = r.plan.reset_password ? ' · пароль: будет сброшен' : ' · пароль: не меняется';
+      const permissionsNote = ' · права: ' + (r.plan.copy_permissions ? permissionsText(r.plan.permissions, 'уже как у образца') : 'не копируются');
       return `<div class="field list-ok"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
-        `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}${passwordNote}</span></div>`;
+        `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}${passwordNote}${permissionsNote}</span></div>`;
     }
     return `<div class="field list-error"><span class="k">${r.target}</span><span class="v">${r.error}</span></div>`;
   }).join('');
@@ -1520,7 +1716,8 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
   const btn = document.getElementById('btnExecute');
   const names = toApply.map(r => r.plan.target_name + ' (' + r.plan.target_extension + ')').join(', ');
   const resetNote = toApply.some(r => r.plan.reset_password) ? '\\n\\nПароли будут СБРОШЕНЫ на новые.' : '';
-  if (!confirm(`Точно применить план к ${toApply.length} пользователям? ${names}${resetNote}`)) return;
+  const permissionsNote = toApply.some(r => (r.plan.permissions || []).length) ? '\\n\\nПрава (Permissions) образца будут добавлены.' : '';
+  if (!confirm(`Точно применить план к ${toApply.length} пользователям? ${names}${resetNote}${permissionsNote}`)) return;
   btn.disabled = true;
   msgEl.className = 'msg info';
   msgEl.textContent = 'Применяю...';
@@ -1529,8 +1726,8 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
     try {
       const result = await api('/api/webitel/execute', {plan: r.plan});
       const passwordNote = result.new_password ? ` · новый пароль: <b class="secret">${esc(result.new_password)}</b>` : '';
-      results.push(`<div class="field list-ok"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
-        `<span class="v status">✓ обновлён${passwordNote}</span></div>`);
+      results.push(`<div class="field ${result.permissions_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
+        `<span class="v status">✓ обновлён${passwordNote}${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
       results.push(`<div class="field list-error"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
         `<span class="v">${e.message}</span></div>`);
@@ -1662,7 +1859,10 @@ document.getElementById('btnCreatePlanSingle').addEventListener('click', async (
   msgEl.className = 'msg info';
   msgEl.textContent = 'Строю план (только чтение)...';
   try {
-    const plan = await api('/api/webitel/create_plan', {template_extension, new_username, new_name, new_extension, city: selectedCity});
+    const plan = await api('/api/webitel/create_plan', {
+      template_extension, new_username, new_name, new_extension, city: selectedCity,
+      copy_permissions: document.getElementById('singleCopyPermissionsCheck').checked,
+    });
     currentCreatePlanSingle = plan;
     msgEl.textContent = '';
     const roleNames = plan.roles.map(r => r.name).join(', ') || '—';
@@ -1673,6 +1873,7 @@ document.getElementById('btnCreatePlanSingle').addEventListener('click', async (
       <div class="field"><span class="k">Roles → будет</span><span class="v">${roleNames}</span></div>
       <div class="field"><span class="k">License → будет</span><span class="v">${licenseIds}</span></div>
       <div class="field"><span class="k">Group → будет</span><span class="v">${plan.group || '—'}</span></div>
+      <div class="field"><span class="k">Permissions → будет</span><span class="v">${plan.copy_permissions ? permissionsText(plan.permissions, 'у образца нет прав для ролей') : 'не копируются (галочка не отмечена)'}</span></div>
       <div class="field"><span class="k">Устройство (SIP)</span><span class="v">${plan.new_extension} — создастся вместе с пользователем</span></div>
       <div class="field"><span class="k">Пароль</span><span class="v">сгенерируется при создании, постоянный (без принудительной смены)</span></div>
     `;
@@ -1695,7 +1896,7 @@ document.getElementById('btnCreateExecuteSingle').addEventListener('click', asyn
   try {
     const result = await api('/api/webitel/create_execute', {plan: currentCreatePlanSingle});
     msgEl.className = 'msg info';
-    msgEl.innerHTML = `Готово. ${result.name} (${result.extension}) создан. Временный пароль: <b>${result.temporary_password}</b>`;
+    msgEl.innerHTML = `Готово. ${result.name} (${result.extension}) создан. Временный пароль: <b>${result.temporary_password}</b>${permissionsResultNote(result)}`;
   } catch (e) {
     msgEl.textContent = 'Ошибка: ' + e.message;
     msgEl.className = 'msg error';
@@ -1741,6 +1942,7 @@ document.getElementById('btnNeighbors').addEventListener('click', async () => {
     listEl.querySelectorAll('.pick-neighbor').forEach(btn => {
       btn.addEventListener('click', () => {
         document.getElementById('singleTemplateExt').value = btn.dataset.ext;
+        document.getElementById('singleTemplateExt').dispatchEvent(new Event('input'));
         markPicked();
       });
     });
@@ -1792,6 +1994,7 @@ document.getElementById('btnCreatePlan').addEventListener('click', async () => {
     try {
       const plan = await api('/api/webitel/create_plan', {
         template_extension, new_username: entry.login, new_name: entry.name, new_extension: entry.login, city: selectedCity,
+        copy_permissions: document.getElementById('bulkCopyPermissionsCheck').checked,
       });
       currentCreatePlans.push({ok: true, plan});
     } catch (e) {
@@ -1807,7 +2010,8 @@ document.getElementById('btnCreatePlan').addEventListener('click', async () => {
       const licenseNames = r.plan.license.map(x => x.prod || x.id).join(', ') || '—';
       return `<div class="field list-ok">` +
         `<span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}</span></div>`;
+        `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}` +
+        ` · права: ${r.plan.copy_permissions ? permissionsText(r.plan.permissions, 'у образца нет прав для ролей') : 'не копируются'}</span></div>`;
     }
     return `<div class="field list-error"><span class="k">${r.login}</span><span class="v">${r.error}</span></div>`;
   }).join('');
@@ -1829,8 +2033,8 @@ document.getElementById('btnCreateExecute').addEventListener('click', async () =
   for (const r of toCreate) {
     try {
       const result = await api('/api/webitel/create_execute', {plan: r.plan});
-      results.push(`<div class="field list-ok"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v status">✓ пароль: ${result.temporary_password}</span></div>`);
+      results.push(`<div class="field ${result.permissions_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
+        `<span class="v status">✓ пароль: ${result.temporary_password}${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
       results.push(`<div class="field list-error"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
         `<span class="v">${e.message}</span></div>`);
@@ -1840,10 +2044,56 @@ document.getElementById('btnCreateExecute').addEventListener('click', async () =
   msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
   btn.disabled = false;
 });
+
+// A plan is for the fields and checkboxes as they were at «Показать план»:
+// changing any of them afterwards drops it, so «Подтвердить» never sends a
+// plan the screen no longer matches (2026-10-19: «Копировать Permissions»
+// ticked after the plan was silently left out of the user created).
+const STALE_PLAN_TEXT = 'Параметры изменились — нажмите «Показать план» заново.';
+
+function dropPlanOnChange(ids, drop) {
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    el.addEventListener(el.type === 'checkbox' ? 'change' : 'input', drop);
+  });
+}
+
+function showStalePlan(msgId, listId, confirmRowId) {
+  const list = document.getElementById(listId);
+  if (list.tagName === 'DIV' && list.classList.contains('result-card')) list.hidden = true; else list.innerHTML = '';
+  document.getElementById(confirmRowId).hidden = true;
+  const msg = document.getElementById(msgId);
+  msg.className = 'msg info';
+  msg.textContent = STALE_PLAN_TEXT;
+}
+
+dropPlanOnChange(['templateExt', 'targetExt', 'resetPasswordCheck', 'copyPermissionsCheck'], () => {
+  if (currentPlans.length === 0) return;
+  currentPlans = [];
+  showStalePlan('planMsg', 'planList', 'confirmRow');
+});
+dropPlanOnChange(['singleNewLogin', 'singleNewName', 'singleTemplateExt', 'singleCopyPermissionsCheck'], () => {
+  if (!currentCreatePlanSingle) return;
+  currentCreatePlanSingle = null;
+  showStalePlan('createPlanMsgSingle', 'createPlanCardSingle', 'createConfirmRowSingle');
+});
+dropPlanOnChange(['createTemplateExt', 'createBulkList', 'bulkCopyPermissionsCheck'], () => {
+  if (currentCreatePlans.length === 0) return;
+  currentCreatePlans = [];
+  showStalePlan('createPlanMsg', 'createPlanList', 'createConfirmRow');
+});
 </script>
 </body>
 </html>
 """
+
+
+_LOCAL_NOTE = "Локальный инструмент. Только на этом компьютере. Каждое реальное изменение требует отдельного подтверждения."
+_SHARED_INDEX_HTML = _INDEX_HTML.replace(
+    _LOCAL_NOTE,
+    "Консоль на сервере. Ваши входы в CRM и Webitel видны только в этом браузере. "
+    "Каждое реальное изменение требует отдельного подтверждения.",
+)
 
 
 def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
@@ -1862,12 +2112,41 @@ class Handler(BaseHTTPRequestHandler):
     # HTTP/1.1 with the explicit Content-Length every response already
     # sends is the standard fix for that class of http.server flakiness.
     protocol_version = "HTTP/1.1"
+    # Idle keep-alive connections and stalled clients don't hold a thread forever.
+    timeout = 60
+
+    def setup(self) -> None:
+        super().setup()
+        # The listening socket defers the TLS handshake to here, the
+        # connection's own thread, so one slow client can't stall accept().
+        if isinstance(self.connection, ssl.SSLSocket):
+            self.connection.do_handshake()
+
+    # Set while answering a page load that started a new workspace.
+    _new_workspace_token = ""
+
+    def _send_common_headers(self) -> None:
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self._new_workspace_token:
+            # A year, so the browser keeps its workspace and saved logins. Lax,
+            # not Strict: following a link to the console from another site
+            # must not start an empty workspace in place of this one.
+            secure = "; Secure" if _TLS_ENABLED else ""
+            self.send_header(
+                "Set-Cookie",
+                f"{_WORKSPACE_COOKIE}={self._new_workspace_token}; Path=/; "
+                f"Max-Age={_WORKSPACE_COOKIE_MAX_AGE}; HttpOnly; SameSite=Lax{secure}",
+            )
 
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1876,19 +2155,83 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self._send_common_headers()
         self.end_headers()
         self.wfile.write(body)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         pass  # keep stdout free of PII-bearing request logs; see artifacts.py's same posture
 
+    def _client_ip(self) -> str:
+        return str(self.client_address[0])
+
+    def _workspace_token(self) -> str:
+        try:
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(_WORKSPACE_COOKIE)
+        except CookieError:
+            return ""
+        return morsel.value if morsel and _WORKSPACE_TOKEN_RE.fullmatch(morsel.value) else ""
+
+    def _cross_site(self) -> bool:
+        """The API only takes JSON from the console's own page: a form or a
+        script on another site can't send this content type without a CORS
+        preflight (never answered here), and browsers name their page in
+        Origin. Guards a local console against hostile sites too."""
+        if not (self.headers.get("Content-Type") or "").lower().startswith("application/json"):
+            return True
+        origin = self.headers.get("Origin")
+        return bool(origin) and urllib.parse.urlsplit(origin).netloc != (self.headers.get("Host") or "")
+
+    def _current_operator(self) -> _Operator | None:
+        """Whose console this request is: the local operator, or on a shared
+        console this browser's workspace (None for a browser that has none —
+        only loading the page starts one)."""
+        if not _SHARED:
+            return _local_operator()
+        token = self._workspace_token()
+        if not token:
+            return None
+        op = _named_operator(_workspace_id(token))
+        now = time.time()
+        with _workspaces_lock:
+            _sweep_idle_workspaces(now)
+            _workspace_seen[op.name] = now
+        return op
+
+    def _run_audited(self, op: _Operator, plan: dict[str, Any], action: Callable[[], Any]) -> Any:
+        """Runs one Webitel change and records who made it (the CRM and
+        Webitel accounts this browser works under), on what, and whether it
+        worked."""
+        login_key = WEBITEL_CITY_KEYS.get(str(plan.get("city") or "almaty"), {}).get("login", "")
+        details = {
+            "crm_login": _crm_login_of(op),
+            "webitel_login": _operator_env(op).get(login_key, "") if login_key else "",
+            **{key: plan[key] for key in _AUDIT_PLAN_FIELDS if key in plan},
+        }
+        try:
+            result = action()
+        except Exception as exc:
+            _audit(op, self._client_ip(), self.path, {**details, "ok": False, "error": str(exc)[:300]})
+            raise
+        if isinstance(result, dict) and result.get("permissions_error"):
+            # The main change went through; only copying permissions failed.
+            details["permissions_error"] = str(result["permissions_error"])[:300]
+        _audit(op, self._client_ip(), self.path, {**details, "ok": True})
+        return result
+
     def do_GET(self) -> None:  # noqa: N802
+        self._new_workspace_token = ""
         if self.path == "/":
-            self._send_html(_INDEX_HTML)
+            if _SHARED and not self._workspace_token():
+                self._new_workspace_token = secrets.token_hex(16)
+                home = _named_operator(_workspace_id(self._new_workspace_token)).env_path.parent
+                home.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._send_html(_SHARED_INDEX_HTML if _SHARED else _INDEX_HTML)
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        self._new_workspace_token = ""
         # Always drain the request body first, regardless of which path
         # branch below actually needs it. Responding without reading a
         # POST body the client already sent leaves unread bytes in the
@@ -1902,8 +2245,16 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             self._send_json(400, {"error": f"invalid request body: {exc}"})
             return
+        if self._cross_site():
+            self._send_json(403, {"error": "cross-site request refused"})
+            return
 
         try:
+            op = self._current_operator()
+            if op is None:
+                self._send_json(400, {"error": "Обновите страницу консоли — браузер не прислал свой cookie"})
+                return
+
             if self.path == "/api/settings/save":
                 # No CRM session reset needed on credential changes: every
                 # /api/crm/login reads the saved CRM login fresh.
@@ -1916,17 +2267,17 @@ class Handler(BaseHTTPRequestHandler):
                     "WEBITEL_ASTANA_LOGIN": body.get("webitel_astana_login", "").strip(),
                     "WEBITEL_ASTANA_PASSWORD": body.get("webitel_astana_password", "").strip(),
                 }
-                _save_env_updates(INFO_ENV_PATH, updates)
+                _save_env_updates(op.env_path, updates)
                 if "crm_visa_owner_id" in body and not updates["CRM_VISA_OWNER_ID"]:
                     # Unlike the passwords, this field is pre-filled with the
                     # saved value, so an empty one means "use my roles".
-                    _remove_env_keys(INFO_ENV_PATH, ("CRM_VISA_OWNER_ID",))
+                    _remove_env_keys(op.env_path, ("CRM_VISA_OWNER_ID",))
                 self._send_json(200, {"saved": True})
                 return
 
             if self.path == "/api/crm/credentials":
                 # Which CRM login is remembered — never the password itself.
-                env = _load_env_file(INFO_ENV_PATH)
+                env = _load_env_file(op.env_path)
                 self._send_json(200, {
                     "login": env.get("CRM_LOGIN", ""),
                     "has_password": bool(env.get("CRM_PASSWORD")),
@@ -1938,22 +2289,22 @@ class Handler(BaseHTTPRequestHandler):
                 # Only the remembered login goes; an already open CRM window
                 # keeps working. The Visa Owner ID goes too, since it was
                 # set for that account and must not carry over to the next.
-                _remove_env_keys(INFO_ENV_PATH, ("CRM_LOGIN", "CRM_PASSWORD", "CRM_VISA_OWNER_ID"))
+                _remove_env_keys(op.env_path, ("CRM_LOGIN", "CRM_PASSWORD", "CRM_VISA_OWNER_ID"))
                 self._send_json(200, {"forgotten": True})
                 return
 
             if self.path == "/api/crm/login":
                 try:
-                    login, password = _resolve_crm_login(body)
+                    login, password = _resolve_crm_login(body, op)
                 except ValueError as exc:
                     self._send_json(400, {"error": str(exc)})
                     return
-                _get_crm_session().start_login(login=login, password=password)
+                _get_crm_session(op).start_login(login=login, password=password)
                 self._send_json(200, {"started": True, "login": login})
                 return
 
             if self.path == "/api/crm/login/status":
-                session = _get_crm_session()
+                session = _get_crm_session(op)
                 status = {"ready": session.is_logged_in(), "browser_open": session.has_open_page(),
                           "code_required": False, "error_text": "", "logged_out": False}
                 if status["browser_open"] and not status["ready"]:
@@ -1967,23 +2318,23 @@ class Handler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     self._send_json(400, {"error": str(exc)})
                     return
-                _get_crm_session().submit_code(code)
+                _get_crm_session(op).submit_code(code)
                 self._send_json(200, {"submitted": True})
                 return
 
             if self.path == "/api/crm/login/screenshot":
-                png = _get_crm_session().screenshot_png()
+                png = _get_crm_session(op).screenshot_png()
                 self._send_json(200, {"png": base64.b64encode(png).decode("ascii")})
                 return
 
             if self.path == "/api/crm/debug/login_check":  # temporary diagnostic
-                self._send_json(200, _get_crm_session().debug_login_check())
+                self._send_json(200, _get_crm_session(op).debug_login_check())
                 return
 
             if self.path == "/api/crm/pending_tickets":
                 # Empty CRM_VISA_OWNER_ID = the logged-in user plus all their roles.
-                visa_owner_id = _load_env_file(INFO_ENV_PATH).get("CRM_VISA_OWNER_ID") or None
-                tickets = _get_crm_session().list_pending_tickets(visa_owner_id)
+                visa_owner_id = _load_env_file(op.env_path).get("CRM_VISA_OWNER_ID") or None
+                tickets = _get_crm_session(op).list_pending_tickets(visa_owner_id)
                 self._send_json(200, {"tickets": tickets})
                 return
 
@@ -1992,7 +2343,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not url:
                     self._send_json(400, {"error": "url is required"})
                     return
-                session = _get_crm_session()
+                session = _get_crm_session(op)
                 ticket = session.read_ticket(url)
                 steps: list[dict[str, Any]] = []
                 entity_id = _ticket_entity_id(url)
@@ -2017,7 +2368,7 @@ class Handler(BaseHTTPRequestHandler):
                 if city not in WEBITEL_STORAGE_STATE_PATHS:
                     self._send_json(400, {"error": f"Unknown city {city!r}"})
                     return
-                self._send_json(200, _webitel_session_state(city))
+                self._send_json(200, _webitel_session_state(op, city))
                 return
 
             if self.path in ("/api/webitel/credentials/save", "/api/webitel/credentials/forget"):
@@ -2026,11 +2377,11 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": f"Unknown city {city!r}"})
                     return
                 if self.path.endswith("/forget"):
-                    _forget_webitel_credentials(city)
+                    _forget_webitel_credentials(op, city)
                     self._send_json(200, {"forgotten": True})
                     return
                 try:
-                    _save_webitel_credentials(city, str(body.get("login") or "").strip(), str(body.get("password") or ""))
+                    _save_webitel_credentials(op, city, str(body.get("login") or "").strip(), str(body.get("password") or ""))
                 except ValueError as exc:
                     self._send_json(400, {"error": str(exc)})
                     return
@@ -2042,7 +2393,7 @@ class Handler(BaseHTTPRequestHandler):
                 if city not in WEBITEL_STORAGE_STATE_PATHS:
                     self._send_json(400, {"error": f"Unknown city {city!r}"})
                     return
-                png = latest_screenshot(WEBITEL_STORAGE_STATE_PATHS[city], city)
+                png = latest_screenshot(op.storage_paths[city], city)
                 if png is None:
                     self._send_json(404, {"error": "Снимков входа в Webitel ещё нет"})
                     return
@@ -2055,7 +2406,7 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": f"Unknown city {city!r}"})
                     return
                 try:
-                    self._send_json(200, _start_webitel_login(city))
+                    self._send_json(200, _start_webitel_login(op, city))
                 except ValueError as exc:
                     self._send_json(400, {"error": str(exc)})
                 return
@@ -2067,8 +2418,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not template_extension or not target_extension:
                     self._send_json(400, {"error": "template_extension and target_extension are required"})
                     return
-                actions = _get_webitel_actions(city)
-                plan = actions.build_plan(template_extension=template_extension, target_extension=target_extension)
+                actions = _get_webitel_actions(op, city)
+                plan = actions.build_plan(
+                    template_extension=template_extension,
+                    target_extension=target_extension,
+                    copy_permissions=body.get("copy_permissions") is True,
+                )
                 plan["city"] = city
                 # Off unless the operator ticked "Сбросить пароль" — execute_plan
                 # only generates a new password when this is True.
@@ -2081,8 +2436,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not plan:
                     self._send_json(400, {"error": "plan is required"})
                     return
-                actions = _get_webitel_actions(plan.get("city", "almaty") or "almaty")
-                result = actions.execute_plan(plan)
+                actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
+                result = self._run_audited(op, plan, lambda: actions.execute_plan(plan))
                 self._send_json(200, result)
                 return
 
@@ -2092,7 +2447,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not extension:
                     self._send_json(400, {"error": "extension is required"})
                     return
-                actions = _get_webitel_actions(city)
+                actions = _get_webitel_actions(op, city)
                 plan = actions.build_delete_plan(extension)
                 plan["city"] = city
                 self._send_json(200, plan)
@@ -2103,8 +2458,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not plan:
                     self._send_json(400, {"error": "plan is required"})
                     return
-                actions = _get_webitel_actions(plan.get("city", "almaty") or "almaty")
-                result = actions.execute_delete_plan(plan)
+                actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
+                result = self._run_audited(op, plan, lambda: actions.execute_delete_plan(plan))
                 self._send_json(200, result)
                 return
 
@@ -2122,7 +2477,7 @@ class Handler(BaseHTTPRequestHandler):
                 if radius < 1 or radius > 50:
                     self._send_json(400, {"error": "radius must be between 1 and 50"})
                     return
-                actions = _get_webitel_actions(city)
+                actions = _get_webitel_actions(op, city)
                 neighbors = actions.find_neighbors(extension, radius=radius)
                 self._send_json(200, {"neighbors": neighbors})
                 return
@@ -2136,12 +2491,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not template_extension or not new_username or not new_name or not new_extension:
                     self._send_json(400, {"error": "template_extension, new_username, new_name and new_extension are required"})
                     return
-                actions = _get_webitel_actions(city)
+                actions = _get_webitel_actions(op, city)
                 plan = actions.build_create_plan(
                     template_extension=template_extension,
                     new_username=new_username,
                     new_name=new_name,
                     new_extension=new_extension,
+                    copy_permissions=body.get("copy_permissions") is True,
                 )
                 plan["city"] = city
                 self._send_json(200, plan)
@@ -2152,8 +2508,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not plan:
                     self._send_json(400, {"error": "plan is required"})
                     return
-                actions = _get_webitel_actions(plan.get("city", "almaty") or "almaty")
-                result = actions.execute_create_plan(plan)
+                actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
+                result = self._run_audited(op, plan, lambda: actions.execute_create_plan(plan))
                 self._send_json(200, result)
                 return
 
@@ -2165,9 +2521,43 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": _operator_error_message(exc)})
 
 
-def run(port: int = 8765) -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Console running at http://127.0.0.1:{port}  (Ctrl+C to stop)")
+class _ConsoleServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Scanners, plain-http requests to the https port and closed tabs
+        # are routine for a console on the network, not tracebacks.
+        if isinstance(sys.exc_info()[1], OSError):
+            return
+        super().handle_error(request, client_address)
+
+
+def run(port: int | None = None) -> None:
+    """Listens as info.env says: CONSOLE_HOST (default 127.0.0.1),
+    CONSOLE_PORT (default 8765, a ``port`` argument wins), CONSOLE_SHARED=1
+    (a workspace per browser) and CONSOLE_TLS_CERT / CONSOLE_TLS_KEY (HTTPS;
+    paths relative to the project root)."""
+    global _SHARED, _TLS_ENABLED
+    env = _load_env_file(INFO_ENV_PATH)
+    host = env.get("CONSOLE_HOST") or "127.0.0.1"
+    port = port or int(env.get("CONSOLE_PORT") or 8765)
+    cert, key = env.get("CONSOLE_TLS_CERT", ""), env.get("CONSOLE_TLS_KEY", "")
+    shared = env.get("CONSOLE_SHARED") == "1"
+    problem = _exposure_problem(host, shared, bool(cert and key))
+    if problem:
+        raise SystemExit(f"Консоль не запущена: {problem}")
+    _SHARED = shared
+    server = _ConsoleServer((host, port), Handler)
+    scheme = "http"
+    if cert and key:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
+        context.load_cert_chain(ROOT / cert, ROOT / key)
+        server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
+        _TLS_ENABLED = True
+        scheme = "https"
+    mode = "общая, у каждого браузера свои входы" if shared else "локальная"
+    print(f"Console running at {scheme}://{host}:{port}  ({mode}; Ctrl+C to stop)")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

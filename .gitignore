@@ -3,6 +3,10 @@
 *.local.env
 info.env
 .auth/
+# Shared console: per-operator logins/sessions, audit log, TLS key
+operators/
+audit/
+tls/
 *.postman_collection.json
 *.postman_environment.json
 

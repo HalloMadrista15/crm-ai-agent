@@ -199,6 +199,7 @@ class CrmSessionManager:
         # Where read_approvals found the full approvals list (schema-level,
         # so it survives re-logins); None until the first successful lookup.
         self._approval_source: dict[str, Any] | None = None
+        self._closed = False
         self._queue: "queue.Queue[tuple[Callable[[CrmSessionManager], Any], queue.Queue]]" = queue.Queue()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -208,7 +209,7 @@ class CrmSessionManager:
 
         with sync_playwright() as p:
             self._playwright = p
-            while True:
+            while not self._closed:
                 try:
                     func, result_q = self._queue.get(timeout=_KEEPALIVE_SECONDS)
                 except queue.Empty:
@@ -234,6 +235,8 @@ class CrmSessionManager:
             pass
 
     def _submit(self, func: Callable[["CrmSessionManager"], Any], timeout: float = 60.0) -> Any:
+        if self._closed:
+            raise CrmSessionError("Браузер CRM закрыт — войдите заново")
         result_q: "queue.Queue[tuple[str, Any]]" = queue.Queue()
         self._queue.put((func, result_q))
         try:
@@ -296,6 +299,34 @@ class CrmSessionManager:
                 page.locator("#passwordEdit-el").first.press("Enter")
 
         self._submit(_do)
+
+    @property
+    def login(self) -> str:
+        """The CRM account this browser last logged in (or tried to) as."""
+        return self._login
+
+    def close(self) -> None:
+        """Closes the CRM browser and ends this manager's thread (and its
+        Playwright driver) for good — an operator logged out of a shared
+        console, or a console login attempt that was abandoned or replaced.
+        Every later call raises CrmSessionError."""
+
+        def _do(mgr: "CrmSessionManager") -> None:
+            mgr._closed = True
+            if mgr._browser is not None:
+                try:
+                    mgr._browser.close()
+                except Exception:
+                    pass
+            mgr._browser = None
+            mgr._page = None
+
+        if self._closed:
+            return
+        try:
+            self._submit(_do, timeout=30.0)
+        except CrmSessionError:
+            self._closed = True
 
     def login_progress(self) -> dict[str, Any]:
         """Read-only look at the login page: whether the CRM is asking for a

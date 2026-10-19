@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import json
 import secrets
+import string
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,6 +60,27 @@ from crm_ai_agent.adapters.webitel_api.session import WebitelApiSession, load_se
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
 
 _REQUEST_TIMEOUT_SECONDS = 15
+
+# Letters and digits only, without 0, o and O (2026-10-16 operator request):
+# a password read off the screen or dictated to a colleague mixes them up.
+PASSWORD_ALPHABET = "".join(c for c in string.ascii_letters + string.digits if c not in "0oO")
+PASSWORD_LENGTH = 16
+
+
+def generate_password(length: int = PASSWORD_LENGTH) -> str:
+    """The one place this project makes up a password (a reset in
+    execute_plan, a new user and its device in execute_create_plan): random
+    from PASSWORD_ALPHABET, always with an upper-case letter, a lower-case
+    letter and a digit. Rejects and redraws rather than patching characters
+    in, so every allowed password stays equally likely."""
+    while True:
+        password = "".join(secrets.choice(PASSWORD_ALPHABET) for _ in range(length))
+        if (
+            any(c.isupper() for c in password)
+            and any(c.islower() for c in password)
+            and any(c.isdigit() for c in password)
+        ):
+            return password
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -123,6 +145,21 @@ class WebitelApiActions:
             raise WebitelApiError(f"PUT {path} failed: HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
             raise WebitelApiError(f"PUT {path} failed: {exc.reason}") from exc
+
+    def _patch(self, path: str, body: Any) -> Any:
+        url = f"{self._base_url}{path}"
+        payload = json.dumps(body).encode("utf-8")
+        headers = {**self._session.headers(), "Content-Type": "application/json"}
+        request = urllib.request.Request(url, data=payload, headers=headers, method="PATCH")
+        try:
+            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
+                raw = response.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise WebitelApiError(f"PATCH {path} failed: HTTP {exc.code}: {detail}") from exc
+        except urllib.error.URLError as exc:
+            raise WebitelApiError(f"PATCH {path} failed: {exc.reason}") from exc
 
     def _delete(self, path: str) -> None:
         url = f"{self._base_url}{path}"
@@ -204,14 +241,56 @@ class WebitelApiActions:
         results.sort(key=lambda r: int(r["extension"]))
         return results
 
-    def build_plan(self, *, template_extension: str, target_extension: str) -> dict[str, Any]:
-        """Read-only: two GETs, no data touched. Returns a plan dict meant
-        to be shown to a human before ``execute_plan`` is ever called."""
+    def get_permissions(self, user_id: str) -> list[dict[str, Any]]:
+        """Read-only: the user's "Permissions" tab — who may read/edit/
+        delete this user record. Confirmed 2026-10-16 against the real
+        system: ``GET /api/users/{id}/acl?page=N&size=M`` returns
+        ``{"page", "next" (only while more pages follow), "items": [{"grantee":
+        {"id", "name", "user": true for a person, absent for a role},
+        "granted": "r" | "rw" | "xrwdxrwd" ...}]}``."""
+
+        items: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            data = self._get(f"/api/users/{user_id}/acl?page={page}&size=100")
+            items.extend(data.get("items") or [])
+            if not data.get("next"):
+                return items
+            page += 1
+
+    def _permissions_to_copy(self, template_id: str, target_id: str | None = None) -> list[dict[str, Any]]:
+        """The template's role grants the target doesn't already have as-is
+        (missing, or set differently); all of them for a user not created
+        yet (``target_id`` None). Grants to individual people
+        (``grantee.user``) — the record's creator, an admin — are left out:
+        copying them would hand whoever created the template full rights
+        over every user cloned from it."""
+
+        current = {} if target_id is None else {
+            p["grantee"]["id"]: p.get("granted", "") for p in self.get_permissions(target_id)
+        }
+        return [
+            {
+                "grantee": p["grantee"]["id"],
+                "name": p["grantee"].get("name", ""),
+                "granted": p.get("granted", ""),
+                "current": current.get(p["grantee"]["id"], ""),
+            }
+            for p in self.get_permissions(template_id)
+            if not p["grantee"].get("user") and current.get(p["grantee"]["id"]) != p.get("granted", "")
+        ]
+
+    def build_plan(self, *, template_extension: str, target_extension: str, copy_permissions: bool = False) -> dict[str, Any]:
+        """Read-only: GETs only, no data touched. Returns a plan dict meant
+        to be shown to a human before ``execute_plan`` is ever called. With
+        ``copy_permissions`` (the "Permissions" checkbox, 2026-10-16) it
+        also lists the template's role grants to add to the target — on top
+        of what the target has, never removing any (operator decision)."""
 
         template = self.get_raw_user(template_extension)
         target = self.get_raw_user(target_extension)
 
-        return {
+        plan = {
             "template_extension": template_extension,
             "template_name": template.get("name", ""),
             "target_extension": target_extension,
@@ -221,6 +300,10 @@ class WebitelApiActions:
             "license": template.get("license", []),
             "group": (template.get("profile") or {}).get("group", ""),
         }
+        if copy_permissions:
+            plan["copy_permissions"] = True
+            plan["permissions"] = self._permissions_to_copy(template["id"], target["id"])
+        return plan
 
     def execute_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
         """Update an EXISTING user's roles/license/group. Re-fetches the
@@ -234,7 +317,12 @@ class WebitelApiActions:
         leave everything but roles/license/group alone. When set, a fresh
         random password is generated (never reused/hardcoded, matching
         execute_create_plan) and returned as ``new_password`` in the
-        result so it can be shown to the approver once."""
+        result so it can be shown to the approver once.
+
+        With ``plan["copy_permissions"]`` the plan's ``permissions`` are then
+        granted on the target — see _grant_permissions."""
+
+        grants = self._planned_grants(plan)
 
         target = self._get(f"/api/users/{plan['target_id']}")
         target["roles"] = plan["roles"]
@@ -244,22 +332,92 @@ class WebitelApiActions:
 
         new_password = None
         if plan.get("reset_password"):
-            new_password = secrets.token_urlsafe(12)
+            new_password = generate_password()
             target["password"] = new_password
 
         result = self._put(f"/api/users/{plan['target_id']}", target)
         if new_password is not None:
             result = {**result, "new_password": new_password}
-        return result
+        return self._grant_permissions(plan["target_id"], grants, result)
+
+    @staticmethod
+    def _planned_grants(plan: dict[str, Any]) -> list[dict[str, Any]]:
+        """The plan's permissions as ``{"grantee": <int id>, "grants", "name"}``
+        — built before any write, so a malformed plan fails before anything
+        changes."""
+        if not plan.get("copy_permissions"):
+            return []
+        return [
+            {"grantee": int(p["grantee"]), "grants": p["granted"], "name": p.get("name", "")}
+            for p in plan.get("permissions") or []
+        ]
+
+    def _grant_permissions(self, user_id: str, grants: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
+        """Makes each planned grantee's permissions on ``user_id`` exactly the
+        planned ones, via ``PATCH /api/users/{id}/acl`` (shape confirmed
+        2026-10-16 from Webitel's own Permissions tab:
+        ``[{"grantee": <id>, "grants": "r"}]``).
+
+        That PATCH does not SET permissions, it FLIPS the letters it names
+        (confirmed 2026-10-18 on test user 30120): "r" + "w" -> "rw", "rw" +
+        "w" -> "r", "rw" + "rw" -> the grantee disappears. So the target's
+        permissions are read first: a grantee that already has the planned
+        ones is left alone, one it lacks gets them, and one with other
+        permissions is first cleared (by sending what it has) and then given
+        the planned ones. This matters for a brand-new user too: Webitel gives
+        it some roles by default (semiadmin, practice seen), and sending those
+        again would take them away — the first version did exactly that.
+        Afterwards the permissions are read back and compared with the plan.
+
+        This runs after the user was already written, so a failure comes
+        back as ``permissions_error`` in the result instead of an exception —
+        raising would lose a password that write already set."""
+        if not grants:
+            return result
+        path = f"/api/users/{user_id}/acl"
+        try:
+            current = {str(p["grantee"]["id"]): p.get("granted", "") for p in self.get_permissions(user_id)}
+        except WebitelApiError as exc:
+            return {**result, "permissions_error": f"не удалось прочитать права перед записью: {exc}"}
+        errors: list[str] = []
+        for grant in grants:
+            have = current.get(str(grant["grantee"]), "")
+            if have == grant["grants"]:
+                continue
+            try:
+                if have:
+                    self._patch(path, [{"grantee": grant["grantee"], "grants": have}])
+                self._patch(path, [{"grantee": grant["grantee"], "grants": grant["grants"]}])
+            except WebitelApiError as exc:
+                errors.append(f"{grant['name'] or grant['grantee']}: {exc}")
+        try:
+            actual = {str(p["grantee"]["id"]): p.get("granted", "") for p in self.get_permissions(user_id)}
+        except WebitelApiError as exc:
+            return {**result, "permissions_error": f"не удалось проверить права после записи: {exc}"}
+        missing = [g for g in grants if actual.get(str(g["grantee"])) != g["grants"]]
+        if missing:
+            names = ", ".join(f"{g['name'] or g['grantee']} ({g['grants']})" for g in missing)
+            detail = f" — {'; '.join(errors)}" if errors else ""
+            return {**result, "permissions_error": f"не встали: {names}{detail}",
+                    "permissions_copied": len(grants) - len(missing)}
+        return {**result, "permissions_copied": len(grants)}
 
     def build_create_plan(
-        self, *, template_extension: str, new_username: str, new_name: str, new_extension: str
+        self,
+        *,
+        template_extension: str,
+        new_username: str,
+        new_name: str,
+        new_extension: str,
+        copy_permissions: bool = False,
     ) -> dict[str, Any]:
         """Read-only: one GET for the template, plus a check that
         ``new_extension`` isn't already taken (creating a duplicate would
         silently shadow an existing user — refuse instead). No password is
         included; ``execute_create_plan`` generates one fresh at write
-        time."""
+        time. With ``copy_permissions`` (the "Permissions" checkbox,
+        2026-10-16) it also lists the template's role grants for the new
+        user, as in build_plan."""
 
         template = self.get_raw_user(template_extension)
 
@@ -270,7 +428,7 @@ class WebitelApiActions:
         else:
             raise WebitelApiError(f"extension={new_extension!r} is already in use — refusing to create a duplicate")
 
-        return {
+        plan = {
             "template_extension": template_extension,
             "template_name": template.get("name", ""),
             "new_username": new_username,
@@ -280,6 +438,10 @@ class WebitelApiActions:
             "license": template.get("license", []),
             "group": (template.get("profile") or {}).get("group", ""),
         }
+        if copy_permissions:
+            plan["copy_permissions"] = True
+            plan["permissions"] = self._permissions_to_copy(template["id"])
+        return plan
 
     def execute_create_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
         """POST a brand-new user, then a matching device (real request
@@ -297,9 +459,13 @@ class WebitelApiActions:
         gap confirmed 2026-09-21 by creating a user through this exact
         code path and finding "Default device" still empty in the UI.
         Re-fetches the user rather than trusting the device POST
-        response's own shape (unconfirmed) to find the device id."""
+        response's own shape (unconfirmed) to find the device id.
 
-        temporary_password = secrets.token_urlsafe(12)
+        With ``plan["copy_permissions"]`` the template's role grants go on
+        the new user last — see _grant_permissions."""
+
+        grants = self._planned_grants(plan)
+        temporary_password = generate_password()
         user_body = {
             "name": plan["new_name"],
             "email": "",
@@ -342,7 +508,7 @@ class WebitelApiActions:
             fresh_user["device"] = devices[0]
             self._put(f"/api/users/{result['id']}", fresh_user)
 
-        return {**result, "temporary_password": temporary_password}
+        return self._grant_permissions(result["id"], grants, {**result, "temporary_password": temporary_password})
 
     def get_presence_status(self, extension: str) -> str | None:
         """Read-only: the "{sip}"/"{dlg}"/... marker behind Webitel's own

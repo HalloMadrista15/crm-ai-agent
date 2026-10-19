@@ -9,6 +9,7 @@ that code, e.g. a missing "url"), and never launches Playwright.
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -153,6 +154,35 @@ class TestConsoleServer(unittest.TestCase):
         self.assertIs(unticked["reset_password"], False)
         self.assertIs(stringy["reset_password"], False)
 
+    def test_copy_plan_carries_the_permissions_checkbox(self) -> None:
+        seen: list[bool] = []
+
+        class _Actions:
+            def build_plan(self, *, copy_permissions: bool = False, **_: str) -> dict:
+                seen.append(copy_permissions)
+                return {"target_id": "1", "roles": [], "license": [], "group": ""}
+
+        body = {"template_extension": "10078", "target_extension": "10087", "city": "almaty"}
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            self._post("/api/webitel/plan", {**body, "copy_permissions": True})
+            self._post("/api/webitel/plan", body)
+            self._post("/api/webitel/plan", {**body, "copy_permissions": "true"})
+        self.assertEqual(seen, [True, False, False])
+
+    def test_create_plan_carries_the_permissions_checkbox(self) -> None:
+        seen: list[bool] = []
+
+        class _Actions:
+            def build_create_plan(self, *, copy_permissions: bool = False, **_: str) -> dict:
+                seen.append(copy_permissions)
+                return {"new_username": "10087", "roles": [], "license": [], "group": ""}
+
+        body = {"template_extension": "10078", "new_username": "10087", "new_name": "N", "new_extension": "10087", "city": "almaty"}
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            self._post("/api/webitel/create_plan", {**body, "copy_permissions": True})
+            self._post("/api/webitel/create_plan", body)
+        self.assertEqual(seen, [True, False])
+
     def test_confirmation_code_endpoint_rejects_non_digits_before_touching_the_crm(self) -> None:
         status, payload = self._post("/api/crm/login/code", {"code": "abc"})
         self.assertEqual(status, 400)
@@ -228,6 +258,209 @@ class TestConsoleServer(unittest.TestCase):
             content = path.read_text(encoding="utf-8")
         self.assertIn("CRM_VISA_OWNER_ID=old-guid", content)
         self.assertIn("WEBITEL_LOGIN=10078", content)
+
+
+class _FakeCrm:
+    """Stands in for CrmSessionManager on the shared console: no browser,
+    the test decides when the CRM asks for a code or accepts the login."""
+
+    instances: list["_FakeCrm"] = []
+
+    def __init__(self, **_: object) -> None:
+        self.logins: list[tuple[str | None, str | None]] = []
+        self.codes: list[str] = []
+        self.logged_in = False
+        self.code_required = False
+        self.closed = False
+        _FakeCrm.instances.append(self)
+
+    @property
+    def login(self) -> str:
+        return (self.logins[-1][0] or "") if self.logins else ""
+
+    def start_login(self, login: str | None = None, password: str | None = None) -> None:
+        self.logins.append((login, password))
+
+    def is_logged_in(self) -> bool:
+        return self.logged_in
+
+    def has_open_page(self) -> bool:
+        return not self.closed
+
+    def login_progress(self) -> dict:
+        return {"code_required": self.code_required, "error_text": "", "logged_out": False}
+
+    def submit_code(self, code: str) -> None:
+        self.codes.append(code)
+        self.logged_in = True
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class TestSharedConsole(unittest.TestCase):
+    """CONSOLE_SHARED=1: the same console for everyone, but each browser has
+    its own workspace (cookie) with its own logins, sessions and CRM browser.
+    Real local HTTP, fake CRM browsers, temp files only."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=5)
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.env_path = self.root / "info.env"
+        # Logins left in the shared info.env from its single-operator days
+        # must never reach any browser.
+        self.env_path.write_text(
+            "CRM_BASE_URL=https://crm.example.invalid\nWEBITEL_ALMATY_BASE_URL=https://wtl-alm.example.invalid\n"
+            "CRM_LOGIN=old.owner\nCRM_PASSWORD=old-pw\nWEBITEL_LOGIN=10078\nWEBITEL_PASSWORD=shared-secret\n",
+            encoding="utf-8",
+        )
+        _FakeCrm.instances = []
+        for patcher in (
+            mock.patch.object(server, "INFO_ENV_PATH", self.env_path),
+            mock.patch.object(server, "OPERATORS_DIR", self.root / "operators"),
+            mock.patch.object(server, "AUDIT_LOG_PATH", self.root / "audit.jsonl"),
+            mock.patch.object(server, "_SHARED", True),
+            mock.patch.object(server, "CrmSessionManager", _FakeCrm),
+            mock.patch.dict(server._crm_sessions, clear=True),
+            mock.patch.dict(server._webitel_login_jobs, clear=True),
+            mock.patch.dict(server._workspace_seen, clear=True),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _open_page(self, cookie: str = ""):
+        request = urllib.request.Request(f"http://127.0.0.1:{self.port}/", headers={"Cookie": cookie} if cookie else {})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.read().decode("utf-8"), response.headers.get("Set-Cookie", "")
+
+    def _new_browser(self) -> str:
+        return self._open_page()[1].split(";", 1)[0]
+
+    def _post(self, path: str, body: dict | None = None, cookie: str = "", headers: dict | None = None):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}",
+            data=json.dumps(body or {}).encode("utf-8"),
+            headers={"Content-Type": "application/json", **({"Cookie": cookie} if cookie else {}), **(headers or {})},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read())
+
+    def _audit_lines(self) -> list[dict]:
+        path = self.root / "audit.jsonl"
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+    def test_opening_the_page_gives_the_browser_its_own_workspace(self) -> None:
+        html, set_cookie = self._open_page()
+        self.assertIn("Консоль на сервере", html)
+        for attribute in ("console_workspace=", "HttpOnly", "SameSite=Lax", "Max-Age="):
+            self.assertIn(attribute, set_cookie)
+        cookie = set_cookie.split(";", 1)[0]
+        token = cookie.split("=", 1)[1]
+        self.assertEqual(self._open_page(cookie)[1], "")  # a known browser keeps its workspace
+        workspaces = [d.name for d in (self.root / "operators").iterdir()]
+        self.assertEqual(workspaces, [server._workspace_id(token)])
+        self.assertNotIn(token, workspaces[0])  # the cookie itself is never on disk
+
+    def test_api_without_a_workspace_starts_nothing(self) -> None:
+        for cookie in ("", "console_workspace=../../etc"):
+            status, payload = self._post("/api/crm/login/status", cookie=cookie)
+            self.assertEqual(status, 400)
+            self.assertIn("Обновите страницу", payload["error"])
+        self.assertEqual(_FakeCrm.instances, [])
+
+    def test_browsers_never_see_each_others_logins(self) -> None:
+        first, second = self._new_browser(), self._new_browser()
+        self._post("/api/webitel/credentials/save", {"city": "almaty", "login": "20001", "password": "a-pw"}, cookie=first)
+        self._post("/api/crm/login", {"login": "m.muratbay", "password": "pw", "remember": True}, cookie=first)
+        _, mine = self._post("/api/webitel/session_status", {"city": "almaty"}, cookie=first)
+        _, theirs = self._post("/api/webitel/session_status", {"city": "almaty"}, cookie=second)
+        _, my_crm = self._post("/api/crm/credentials", cookie=first)
+        _, their_crm = self._post("/api/crm/credentials", cookie=second)
+        self.assertEqual((mine["login"], mine["has_password"]), ("20001", True))
+        self.assertEqual((theirs["login"], theirs["has_password"]), ("", False))
+        self.assertEqual((my_crm["login"], my_crm["has_password"]), ("m.muratbay", True))
+        self.assertEqual((their_crm["login"], their_crm["has_password"]), ("", False))
+
+    def test_each_browser_has_its_own_crm_browser(self) -> None:
+        first, second = self._new_browser(), self._new_browser()
+        self._post("/api/crm/login", {"login": "m.muratbay", "password": "pw"}, cookie=first)
+        self._post("/api/crm/login", {"login": "i.ivanov", "password": "pw2"}, cookie=second)
+        self.assertEqual([crm.logins for crm in _FakeCrm.instances], [[("m.muratbay", "pw")], [("i.ivanov", "pw2")]])
+        _FakeCrm.instances[0].logged_in = True
+        self.assertIs(self._post("/api/crm/login/status", cookie=first)[1]["ready"], True)
+        self.assertIs(self._post("/api/crm/login/status", cookie=second)[1]["ready"], False)
+
+    def test_cross_site_requests_are_refused(self) -> None:
+        cookie = self._new_browser()
+        status, _ = self._post("/api/crm/credentials", cookie=cookie, headers={"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+        status, _ = self._post("/api/crm/credentials", cookie=cookie, headers={"Content-Type": "text/plain"})
+        self.assertEqual(status, 403)
+        status, _ = self._post("/api/crm/credentials", cookie=cookie, headers={"Origin": f"http://127.0.0.1:{self.port}"})
+        self.assertEqual(status, 200)
+
+    def test_an_idle_workspace_gets_its_crm_browser_closed(self) -> None:
+        idle, active = self._new_browser(), self._new_browser()
+        self._post("/api/crm/login", {"login": "m.muratbay", "password": "pw"}, cookie=idle)
+        crm = _FakeCrm.instances[-1]
+        workspace = server._workspace_id(idle.split("=", 1)[1])
+        server._workspace_seen[workspace] = time.time() - server._WORKSPACE_IDLE_SECONDS - 1
+        self._post("/api/crm/credentials", cookie=active)
+        for _ in range(50):
+            if crm.closed:
+                break
+            time.sleep(0.02)
+        self.assertTrue(crm.closed)
+        self.assertNotIn(workspace, server._crm_sessions)
+
+    def test_webitel_changes_are_audited_without_secrets(self) -> None:
+        cookie = self._new_browser()
+        self._post("/api/webitel/credentials/save", {"city": "almaty", "login": "20001", "password": "a-pw"}, cookie=cookie)
+        self._post("/api/crm/login", {"login": "m.muratbay", "password": "pw"}, cookie=cookie)
+
+        class _Actions:
+            def execute_create_plan(self, plan: dict) -> dict:
+                return {"created": True, "temporary_password": "S3cret-pw"}
+
+        plan = {"city": "almaty", "new_username": "10087", "new_name": "Иван Иванов", "new_extension": "10087",
+                "template_extension": "10078", "roles": [{"name": "agent"}]}
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, result = self._post("/api/webitel/create_execute", {"plan": plan}, cookie=cookie)
+        self.assertEqual((status, result["temporary_password"]), (200, "S3cret-pw"))
+        entry = self._audit_lines()[-1]
+        self.assertEqual(
+            (entry["crm_login"], entry["webitel_login"], entry["action"], entry["new_extension"], entry["ok"]),
+            ("m.muratbay", "20001", "/api/webitel/create_execute", "10087", True),
+        )
+        self.assertEqual(len(entry["workspace"]), 8)
+        self.assertNotIn("S3cret-pw", (self.root / "audit.jsonl").read_text(encoding="utf-8"))
+        self.assertNotIn("roles", entry)
+
+
+class TestSharedConsoleConfig(unittest.TestCase):
+    def test_never_listens_on_the_network_unless_shared_and_https(self) -> None:
+        self.assertNotEqual(server._exposure_problem("0.0.0.0", False, True), "")
+        self.assertNotEqual(server._exposure_problem("0.0.0.0", True, False), "")
+        self.assertEqual(server._exposure_problem("0.0.0.0", True, True), "")
+        self.assertEqual(server._exposure_problem("127.0.0.1", False, False), "")
 
 
 class TestResolveCrmLogin(unittest.TestCase):
