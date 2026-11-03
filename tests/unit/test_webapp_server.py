@@ -183,6 +183,56 @@ class TestConsoleServer(unittest.TestCase):
             self._post("/api/webitel/create_plan", body)
         self.assertEqual(seen, [True, False])
 
+    def test_group_plan_needs_a_number_a_name_and_members(self) -> None:
+        full = {"number": "30151", "name": "G", "extensions": ["30152"]}
+        for body in ({**full, "number": ""}, {**full, "name": " "}, {**full, "extensions": []}, {**full, "extensions": "30152"}):
+            status, payload = self._post("/api/webitel/group_plan", body)
+            self.assertEqual(status, 400, body)
+            self.assertIn("групповой номер", payload["error"])
+
+    def test_group_plan_uses_the_citys_template_and_carries_the_city(self) -> None:
+        seen: list[dict] = []
+
+        class _Actions:
+            def build_group_plan(self, **kwargs) -> dict:
+                seen.append(kwargs)
+                return {"name": kwargs["name"], "members": []}
+
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, plan = self._post("/api/webitel/group_plan",
+                                      {"number": " 30151", "name": " G ", "extensions": ["30152", " ", 30153], "city": "almaty"})
+            self._post("/api/webitel/group_plan",
+                       {"number": "21701", "name": "G", "extensions": ["21703"], "fallback": " 21700 ", "city": "astana"})
+        self.assertEqual((status, plan["city"]), (200, "almaty"))
+        self.assertEqual(seen, [
+            {"city": "almaty", "name": "G", "number": "30151", "extensions": ["30152", "30153"], "fallback": ""},
+            {"city": "astana", "name": "G", "number": "21701", "extensions": ["21703"], "fallback": "21700"},
+        ])
+
+    def test_group_plan_refuses_a_city_without_a_template(self) -> None:
+        with mock.patch("crm_ai_agent.adapters.webitel_api.actions.GROUP_RING_SECONDS", {"almaty": "30"}):
+            status, payload = self._post("/api/webitel/group_plan",
+                                         {"number": "28150", "name": "G", "extensions": ["28071"], "city": "astana"})
+        self.assertEqual(status, 400)
+        self.assertIn("шаблона", payload["error"])
+
+    def test_password_endpoints_need_an_extension_and_a_plan(self) -> None:
+        self.assertEqual(self._post("/api/webitel/password_plan", {"extension": " "})[0], 400)
+        self.assertEqual(self._post("/api/webitel/password_execute", {})[0], 400)
+
+    def test_password_plan_carries_the_city(self) -> None:
+        class _Actions:
+            def build_password_plan(self, extension: str) -> dict:
+                return {"extension": extension, "id": "1", "devices": []}
+
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, plan = self._post("/api/webitel/password_plan", {"extension": "28071", "city": "astana"})
+        self.assertEqual((status, plan["extension"], plan["city"]), (200, "28071", "astana"))
+
+    def test_group_execute_requires_plan(self) -> None:
+        status, _ = self._post("/api/webitel/group_execute", {})
+        self.assertEqual(status, 400)
+
     def test_confirmation_code_endpoint_rejects_non_digits_before_touching_the_crm(self) -> None:
         status, payload = self._post("/api/crm/login/code", {"code": "abc"})
         self.assertEqual(status, 400)
@@ -453,6 +503,37 @@ class TestSharedConsole(unittest.TestCase):
         self.assertEqual(len(entry["workspace"]), 8)
         self.assertNotIn("S3cret-pw", (self.root / "audit.jsonl").read_text(encoding="utf-8"))
         self.assertNotIn("roles", entry)
+
+    def test_a_password_reset_is_audited_without_the_password(self) -> None:
+        cookie = self._new_browser()
+
+        class _Actions:
+            def execute_password_plan(self, plan: dict) -> dict:
+                return {"extension": "30120", "new_password": "N3w-secret-pw", "devices_error": "30120: HTTP 400"}
+
+        plan = {"city": "almaty", "extension": "30120", "id": "6197", "name": "TEST1", "devices": [{"id": "150571", "name": "30120"}]}
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, result = self._post("/api/webitel/password_execute", {"plan": plan}, cookie=cookie)
+        entry = self._audit_lines()[-1]
+        self.assertEqual((status, result["new_password"], entry["extension"], entry["ok"]), (200, "N3w-secret-pw", "30120", True))
+        self.assertIn("HTTP 400", entry["devices_error"])
+        self.assertNotIn("N3w-secret-pw", (self.root / "audit.jsonl").read_text(encoding="utf-8"))
+
+    def test_a_group_whose_route_failed_is_audited_with_the_error(self) -> None:
+        cookie = self._new_browser()
+
+        class _Actions:
+            def execute_group_plan(self, plan: dict) -> dict:
+                return {"id": 371, "name": plan["name"], "route_error": "POST /api/routing/outbound/calls failed: HTTP 400"}
+
+        plan = {"city": "almaty", "name": "ALM-OP-30151", "number": "30151", "schema": [],
+                "members": [{"extension": "30152", "name": "Иван"}]}
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, _ = self._post("/api/webitel/group_execute", {"plan": plan}, cookie=cookie)
+        entry = self._audit_lines()[-1]
+        self.assertEqual((status, entry["action"], entry["number"], entry["ok"]), (200, "/api/webitel/group_execute", "30151", True))
+        self.assertIn("HTTP 400", entry["route_error"])
+        self.assertNotIn("schema", entry)
 
 
 class TestSharedConsoleConfig(unittest.TestCase):

@@ -14,10 +14,12 @@ narrower "update an existing user" implementation of the same action).
 Never fabricated.
 
 Safety posture, matching everything built so far:
-- ``build_plan``/``build_create_plan``/``build_delete_plan`` are pure read
-  (GETs only) and never touch any user's data. ``execute_plan``,
-  ``execute_create_plan``, and ``execute_delete_plan`` are the only
-  functions in this project that perform a write/delete, and each is
+- ``build_plan``/``build_create_plan``/``build_delete_plan``/
+  ``build_group_plan`` are pure read (GETs only) and never touch any data.
+  ``execute_plan``, ``execute_create_plan``, ``execute_delete_plan`` and
+  ``execute_group_plan`` (a group number's Flow schema and Dialplan route,
+  2026-11-02) are the
+  only functions in this project that perform a write/delete, and each is
   reachable only through the console's explicit two-step "show plan, then
   confirm" flow — never auto-triggered by a plan or ticket read.
 - ``execute_delete_plan`` (added 2026-09-20, real endpoint/shape confirmed
@@ -48,6 +50,7 @@ Safety posture, matching everything built so far:
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import string
 import urllib.error
@@ -81,6 +84,94 @@ def generate_password(length: int = PASSWORD_LENGTH) -> str:
             and any(c.isdigit() for c in password)
         ):
             return password
+
+
+# How long a group's members ring, per city whose group number template this
+# module has (the operator's own, pasted 2026-11-02/03). A city missing here
+# has no template yet, and its group plan is refused.
+GROUP_RING_SECONDS = {"almaty": "30", "astana": "15"}
+# Only Astana's template may end by handing an unanswered call to one more
+# number — and only some of its groups do.
+GROUP_FALLBACK_CITIES = ("astana",)
+
+
+def _group_start(name: str) -> list[dict[str, Any]]:
+    return [
+        {"ringReady": ""},
+        {"preAnswer": ""},
+        {"recordSession": {
+            "action": "start", "bridged": True, "followTransfer": True,
+            "minSec": 2, "stereo": True, "type": "mp3",
+        }},
+        {"log": f">> {name} <<<"},
+    ]
+
+
+def _ring_members(extensions: list[str], seconds: str) -> dict[str, Any]:
+    return {"bridge": {
+        "endpoints": [
+            {"extension": extension, "parameters": {"leg_timeout": seconds}, "type": "user"}
+            for extension in extensions
+        ],
+        "strategy": "fork",
+    }}
+
+
+def group_schema(city: str, name: str, extensions: list[str], fallback: str = "") -> list[dict[str, Any]]:
+    """A group number's Flow schema: that city's template with only the log
+    line (the group's name) and the members filled in — all ringing at once
+    ("fork"). Almaty adds ringback tones (``transfer`` 488 is an id in
+    Almaty's Webitel only) and ``busy`` once answered; Astana rings for 15 s
+    instead of 30 and, given a ``fallback``, then calls that number if its
+    user is idle (an int there, as in the operator's template)."""
+    seconds = GROUP_RING_SECONDS.get(city)
+    if seconds is None:
+        raise WebitelApiError("для этого города шаблона группового номера пока нет")
+    if fallback and city not in GROUP_FALLBACK_CITIES:
+        raise WebitelApiError("в шаблоне этого города нет номера на случай, если никто не ответил")
+    set_step = {"set": {"continue_on_fail": "true", "hangup_after_bridge": "true"}}
+    if city == "almaty":
+        tone = {"name": "%(1000,6000,425);loops=-1", "type": "tone"}
+        return [
+            set_step,
+            {"ringback": {"all": True, "call": dict(tone), "hold": dict(tone), "transfer": {"id": 488}}},
+            *_group_start(name),
+            _ring_members(extensions, seconds),
+            {"bridge": {"bridged": [{"log": "Ok call is bridged"}, {"set": {"busy": "2"}}, {"log": "END call is bridged"}]}},
+            {"hangup": ""},
+        ]
+    fallback_step = [{"bridge": {"endpoints": [{"extension": int(fallback), "idle": True, "type": "user"}]}}] if fallback else []
+    return [
+        set_step,
+        *_group_start(name),
+        _ring_members(extensions, seconds),
+        *fallback_step,
+        {"hangup": ""},
+    ]
+
+
+def _check_group_numbers(number: str, extensions: list[str], fallback: str) -> None:
+    """The group number goes into the route's pattern, so only digits
+    (anything else could make a pattern that catches other numbers too); the
+    fallback goes into the schema as an int, so no leading 0 either. Neither
+    may lead back to the group number: the call would just come round
+    again."""
+    if not re.fullmatch(r"[0-9]+", number):
+        raise WebitelApiError(f"групповой номер «{number}» — только цифры")
+    if number in extensions:
+        raise WebitelApiError(f"групповой номер {number} не может быть среди участников")
+    if fallback and not re.fullmatch(r"[1-9][0-9]*", fallback):
+        raise WebitelApiError(f"номер «если никто не ответил» «{fallback}» — только цифры")
+    if fallback == number:
+        raise WebitelApiError("если никто не ответил, звонок не может уйти обратно на групповой номер")
+
+
+# The fields Webitel's Devices form sends on «Save», with what it sends for
+# one left empty — a device's GET omits empty fields.
+_DEVICE_FORM_FIELDS: dict[str, Any] = {
+    "name": "", "account": "", "user": {}, "phone": {}, "ip": "", "brand": "", "model": "", "mac": "",
+    "hotdesks": [], "hotdesk": False,
+}
 
 
 def _load_env_file(path: Path) -> dict[str, str]:
@@ -337,8 +428,38 @@ class WebitelApiActions:
 
         result = self._put(f"/api/users/{plan['target_id']}", target)
         if new_password is not None:
-            result = {**result, "new_password": new_password}
+            result = self._set_device_passwords(target, new_password, {**result, "new_password": new_password})
         return self._grant_permissions(plan["target_id"], grants, result)
+
+    def _set_device_passwords(self, user: dict[str, Any], password: str, result: dict[str, Any]) -> dict[str, Any]:
+        """Gives each of the user's devices the user's new password: the two
+        must match (operator rule, 2026-11-03), and a phone registers with
+        the device's. Runs after the user's own password was already
+        changed, so a failure comes back as ``devices_error`` — with the new
+        password still in the result — instead of an exception."""
+        updated: list[str] = []
+        errors: list[str] = []
+        for device in user.get("devices") or []:
+            label = device.get("name") or str(device.get("id", ""))
+            try:
+                self._set_device_password(str(device["id"]), password)
+            except (WebitelApiError, KeyError) as exc:
+                errors.append(f"{label}: {exc}")
+                continue
+            updated.append(label)
+        result = {**result, "devices_updated": updated}
+        return {**result, "devices_error": "; ".join(errors)} if errors else result
+
+    def _set_device_password(self, device_id: str, password: str) -> None:
+        """``PUT /api/devices/{id}`` with the body Webitel's own Devices form
+        sends on «Save» (confirmed 2026-11-03): every field of the form, each
+        carried over from the device's current record, only the password
+        new. The PUT replaces the whole device, so a field left out would be
+        blanked — a desk phone's MAC or model, say."""
+        device = self._get(f"/api/devices/{device_id}")
+        body = {key: device.get(key, default) for key, default in _DEVICE_FORM_FIELDS.items()}
+        body["password"] = password
+        self._put(f"/api/devices/{device_id}", body)
 
     @staticmethod
     def _planned_grants(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -510,6 +631,117 @@ class WebitelApiActions:
 
         return self._grant_permissions(result["id"], grants, {**result, "temporary_password": temporary_password})
 
+    def find_schema(self, name: str) -> dict[str, Any] | None:
+        """Read-only: the Flow schema named exactly ``name``, or None. The
+        search (``q``) also matches parts of names, so names are compared
+        here. List shape assumed to be Webitel's usual ``{"items": [...]}``
+        like /api/users — not yet seen from the real Flow page."""
+        query = urllib.parse.quote(name)
+        data = self._get(f"/api/routing/schema?page=1&size=100&q={query}")
+        items = data if isinstance(data, list) else data.get("items") or []
+        return next((item for item in items if item.get("name") == name), None)
+
+    def find_route(self, number: str) -> dict[str, Any] | None:
+        """Read-only: the Dialplan route whose pattern is exactly
+        ``^<number>$`` (what execute_group_plan creates), or None. Reads
+        every route page by page (``next`` while more follow, as in
+        get_permissions) and compares patterns here, since what the search
+        matches is unknown. List shape assumed, not yet seen from the real
+        Dialplan page."""
+        pattern = f"^{number}$"
+        for page in range(1, 101):
+            data = self._get(f"/api/routing/outbound/calls?page={page}&size=100")
+            items = data if isinstance(data, list) else data.get("items") or []
+            found = next((item for item in items if item.get("pattern") == pattern), None)
+            if found is not None or isinstance(data, list) or not data.get("next"):
+                return found
+        return None
+
+    def _check_group_is_new(self, name: str, number: str) -> None:
+        if self.find_schema(name) is not None:
+            raise WebitelApiError(f"схема «{name}» уже есть в Webitel — дубликат не создаю")
+        route = self.find_route(number)
+        if route is not None:
+            raise WebitelApiError(f"на номер {number} уже есть маршрут Dialplan «{route.get('name', '')}»")
+
+    def build_group_plan(
+        self, *, city: str, name: str, number: str, extensions: list[str], fallback: str = "",
+    ) -> dict[str, Any]:
+        """Read-only. ``number`` is the group number callers dial, and
+        ``fallback`` (Astana only, optional) who gets the call when no member
+        answered — see _check_group_numbers. Refuses a name some Flow schema
+        already has, a number some route already leads, and members or a
+        fallback that aren't Webitel users (a bridge to a missing extension
+        just never rings) — every missing one named at once. Repeated
+        extensions are kept once. A number that is also a user's own
+        extension is only flagged (``number_user``): the route would send
+        that user's calls to the group. The plan carries the schema
+        execute_group_plan will post, for the approver to see."""
+        extensions = list(dict.fromkeys(extensions))
+        _check_group_numbers(number, extensions, fallback)
+        schema = group_schema(city, name, extensions, fallback)
+        self._check_group_is_new(name, number)
+        names: dict[str, str] = {}
+        missing: list[str] = []
+        for extension in dict.fromkeys([*extensions, *([fallback] if fallback else [])]):
+            try:
+                names[extension] = self.get_raw_user(extension).get("name", "")
+            except SubjectNotFoundError:
+                missing.append(extension)
+        if missing:
+            raise WebitelApiError(f"нет пользователя Webitel с номером: {', '.join(missing)}")
+        try:
+            number_user = self.get_raw_user(number).get("name") or number
+        except SubjectNotFoundError:
+            number_user = ""
+        return {
+            "name": name,
+            "number": number,
+            "number_user": number_user,
+            "members": [{"extension": extension, "name": names[extension]} for extension in extensions],
+            "ring_seconds": GROUP_RING_SECONDS[city],
+            "fallback": fallback,
+            "fallback_name": names.get(fallback, ""),
+            "schema": schema,
+        }
+
+    def execute_group_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """POSTs the group's Flow schema, then the Dialplan route sending the
+        group number to it — both request shapes confirmed 2026-11-02 from
+        Webitel's own forms (Flow → «Код», ``editor: false``; Dialplan →
+        «Добавить»). Re-checks name and number first: either may have been
+        taken since the plan was shown. The schema is rebuilt from the
+        plan's city, name, members and fallback rather than taken from the
+        plan.
+
+        A failed route comes back as ``route_error`` instead of an
+        exception: the schema already exists by then and the operator must
+        know its id."""
+        name, number, fallback = plan["name"], plan["number"], plan.get("fallback") or ""
+        extensions = [m["extension"] for m in plan["members"]]
+        _check_group_numbers(number, extensions, fallback)
+        steps = group_schema(plan.get("city") or "almaty", name, extensions, fallback)
+        self._check_group_is_new(name, number)
+        schema = self._post("/api/routing/schema", {
+            "name": name,
+            "type": "voice",
+            "editor": False,
+            "schema": steps,
+            "payload": {},
+            "tags": [],
+        })
+        result = {"id": schema.get("id"), "name": name, "number": number, "members": extensions}
+        try:
+            route = self._post("/api/routing/outbound/calls", {
+                "name": name,
+                "schema": {"type": "voice", "editor": False, "id": str(schema["id"]), "name": name},
+                "pattern": f"^{number}$",
+                "description": "",
+            })
+        except (WebitelApiError, KeyError) as exc:
+            return {**result, "route_error": str(exc)}
+        return {**result, "route_id": route.get("id")}
+
     def get_presence_status(self, extension: str) -> str | None:
         """Read-only: the "{sip}"/"{dlg}"/... marker behind Webitel's own
         Web/SIP/Dlg/DnD status chips in the user list (confirmed
@@ -613,3 +845,43 @@ class WebitelApiActions:
             "name": plan.get("name", ""),
             "deleted_device_ids": plan.get("device_ids", []),
         }
+
+    def build_password_plan(self, extension: str) -> dict[str, Any]:
+        """Read-only: whose password a reset changes, which devices get the
+        same one, and whether the user is online now — a phone or softphone
+        registered with the old password drops off until it's given the new
+        one."""
+        user = self.get_raw_user(extension)
+        presence = self.presence_labels(self.get_presence_status(extension))
+        return {
+            "extension": extension,
+            "id": user["id"],
+            "name": user.get("name", ""),
+            "username": user.get("username", ""),
+            "devices": [
+                {"id": d["id"], "name": d.get("name", "")} for d in user.get("devices") or [] if d.get("id")
+            ],
+            "presence": presence,
+        }
+
+    def execute_password_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """A fresh random password (generate_password) for the user, then the
+        same one for each of their devices — see _set_device_passwords.
+        Re-fetches by extension first and refuses if it now belongs to
+        someone else, as execute_delete_plan does. The user's record is put
+        back whole with only the password set, the way execute_plan resets
+        one (Webitel's PUT replaces the whole record)."""
+        user = self.get_raw_user(plan["extension"])
+        if user["id"] != plan["id"]:
+            raise WebitelApiError(
+                f"extension={plan['extension']!r} now belongs to a different user "
+                f"(id {user['id']!r}, was {plan['id']!r} when the plan was built) — refusing to reset"
+            )
+        password = generate_password()
+        user["password"] = password
+        self._put(f"/api/users/{user['id']}", user)
+        return self._set_device_passwords(user, password, {
+            "extension": plan["extension"],
+            "name": user.get("name", ""),
+            "new_password": password,
+        })

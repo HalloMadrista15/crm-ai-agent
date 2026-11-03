@@ -413,7 +413,7 @@ def _exposure_problem(host: str, shared: bool, tls: bool) -> str:
 # result's secrets (e.g. the temporary password a reset or create returns).
 _AUDIT_PLAN_FIELDS = (
     "city", "template_extension", "target_extension", "target_name", "copy_permissions", "permissions",
-    "new_username", "new_name", "new_extension", "extension", "name", "reset_password",
+    "new_username", "new_name", "new_extension", "extension", "name", "reset_password", "number", "members", "fallback", "devices",
 )
 _audit_lock = threading.Lock()
 
@@ -517,6 +517,9 @@ _INDEX_HTML = """<!doctype html>
   .city-btn.active{background:var(--accent);color:var(--accent-ink);box-shadow:0 1px 2px rgba(0,0,0,.3);}
   .city-btn.active:hover{background:var(--accent);color:var(--accent-ink);}
   .hint{font-size:12px;color:var(--text-faint);margin-top:6px;}
+  .schema-json{margin:2px 0 8px;}
+  .schema-json summary{cursor:pointer;font-size:12px;color:var(--text-soft);}
+  .schema-json pre{margin-top:6px;max-height:320px;overflow:auto;}
   code{background:var(--accent-soft);color:var(--text);border-radius:4px;padding:1px 5px;font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}
   .checkbox-row{display:flex;align-items:center;gap:7px;font-size:12.5px;color:var(--text-soft);margin-bottom:12px;cursor:pointer;user-select:none;}
   .checkbox-row input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent);cursor:pointer;}
@@ -654,6 +657,8 @@ _INDEX_HTML = """<!doctype html>
       <button type="button" class="nav-link" data-section="copy">Копировать</button>
       <button type="button" class="nav-link" data-section="create">Создать</button>
       <button type="button" class="nav-link" data-section="delete">Удалить</button>
+      <button type="button" class="nav-link" data-section="groups">Группы</button>
+      <button type="button" class="nav-link" data-section="password">Пароль</button>
     </div>
     <button type="button" class="nav-account-btn" data-section="account"><span class="status-dot" id="navLoginDot" title="CRM: не выполнен вход"></span>Вход и настройки</button>
   </div>
@@ -1022,6 +1027,123 @@ _INDEX_HTML = """<!doctype html>
   </div>
   </section>
 
+  <section class="app-section" data-section-panel="groups" hidden>
+  <div class="steps">
+
+  <div class="card">
+    <div class="card-head"><h2>Webitel: групповой номер</h2></div>
+    <div class="card-body">
+
+      <div class="tabs">
+        <button type="button" class="tab-btn active" data-tab="group-single">Одна группа</button>
+        <button type="button" class="tab-btn" data-tab="group-bulk">Несколько</button>
+      </div>
+
+      <div class="tab-panel split form-split" data-panel="group-single">
+        <div class="split-main">
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="groupNumber">Групповой номер (на него звонят)</label>
+            <input type="text" id="groupNumber" inputmode="numeric" placeholder="напр. 30151">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="groupName">Название</label>
+            <input type="text" id="groupName" placeholder="напр. ALM-OP-30151">
+          </div>
+        </div>
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="groupMembers">Участники — номера, которые звонят</label>
+            <textarea id="groupMembers" rows="4" placeholder="напр. 30152, 30153"></textarea>
+            <div class="hint">Через запятую, пробел или с новой строки. Звонят все сразу.</div>
+          </div>
+        </div>
+        <div class="row" data-city-only="astana" hidden>
+          <div class="field-group">
+            <label class="field-label" for="groupFallback">Если никто не ответил — на номер (необязательно)</label>
+            <input type="text" id="groupFallback" inputmode="numeric" placeholder="напр. 21700">
+          </div>
+        </div>
+        <div class="row">
+          <button id="btnGroupPlanSingle">Показать план</button>
+        </div>
+        </div>
+        <div class="split-side">
+        <div id="groupPlanMsgSingle" class="msg info"></div>
+        <div id="groupPlanListSingle" class="list"></div>
+        <div class="row" id="groupConfirmRowSingle" hidden>
+          <button id="btnGroupExecuteSingle" class="danger">Подтвердить и создать</button>
+        </div>
+        <div id="groupExecuteMsgSingle" class="msg info"></div>
+        <div class="split-placeholder">Здесь появится план. Схема в Webitel не создаётся, пока вы не подтвердите.</div>
+        </div>
+      </div>
+
+      <div class="tab-panel split form-split" data-panel="group-bulk" hidden>
+        <div class="split-main">
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="groupBulkList">Группы (по одной на строку)</label>
+            <textarea id="groupBulkList" rows="6" placeholder="30151, ALM-OP-30151: 30152, 30153&#10;30161, ALM-OP-30161: 30162, 30163"></textarea>
+            <div class="hint">Формат строки: <code>номер, название: участники</code><span data-city-only="astana" hidden>. Если никто не ответил — на номер: в конце <code>&gt; номер</code></span></div>
+          </div>
+        </div>
+        <div class="row">
+          <button id="btnGroupPlanBulk">Показать план для всех</button>
+        </div>
+        </div>
+        <div class="split-side">
+        <div id="groupPlanMsgBulk" class="msg info"></div>
+        <div id="groupPlanListBulk" class="list"></div>
+        <div class="row" id="groupConfirmRowBulk" hidden>
+          <button id="btnGroupExecuteBulk" class="danger">Подтвердить и создать все</button>
+        </div>
+        <div id="groupExecuteMsgBulk" class="msg info"></div>
+        <div class="split-placeholder">Здесь появится план для всех строк. Ничего не создаётся, пока вы не подтвердите.</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  </div>
+  </section>
+
+  <section class="app-section" data-section-panel="password" hidden>
+  <div class="steps">
+
+  <div class="card">
+    <div class="card-head"><h2>Webitel: сброс пароля (пользователь и его устройство)</h2></div>
+    <div class="card-body split form-split">
+      <div class="split-main">
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="passwordExt">Логин/добавочный (можно несколько через запятую)</label>
+            <input type="text" id="passwordExt" placeholder="напр. 10087, 10097">
+            <div class="hint">Новый пароль будет один и тот же у пользователя и его устройства.</div>
+          </div>
+        </div>
+        <div class="row">
+          <button id="btnPasswordPlan">Показать план</button>
+        </div>
+      </div>
+      <div class="split-side">
+        <div id="passwordPlanMsg" class="msg info"></div>
+        <div id="passwordPlanList" class="list"></div>
+        <div class="row" id="passwordConfirmRow" hidden>
+          <button id="btnPasswordExecute" class="danger">Подтвердить и сбросить</button>
+        </div>
+        <div id="passwordExecuteMsg" class="msg info"></div>
+        <div class="split-placeholder">Здесь появится список. Пароли не меняются, пока вы не подтвердите.</div>
+      </div>
+    </div>
+  </div>
+
+  </div>
+  </section>
+
 </div>
 
 <script>
@@ -1041,7 +1163,7 @@ async function api(path, body) {
 }
 
 const navButtons = document.querySelectorAll('.nav-link, .nav-account-btn');
-const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete'];
+const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password'];
 
 navButtons.forEach(btn => {
   btn.addEventListener('click', () => {
@@ -1066,21 +1188,29 @@ const CITY_PLACEHOLDERS = {
     templateExt: 'напр. 10078', targetExt: 'напр. 10079, 10080',
     singleNewLogin: 'напр. 10087', singleTemplateExt: 'напр. 10078',
     createTemplateExt: 'напр. 10078', createBulkList: '10087,Иван Иванов\\n10097,Мария Петрова',
-    deleteExt: 'напр. 10087, 10097',
+    deleteExt: 'напр. 10087, 10097', passwordExt: 'напр. 10087, 10097',
+    groupNumber: 'напр. 30151', groupName: 'напр. ALM-OP-30151', groupMembers: 'напр. 30152, 30153',
+    groupBulkList: '30151, ALM-OP-30151: 30152, 30153\\n30161, ALM-OP-30161: 30162, 30163',
   },
   astana: {
     templateExt: 'напр. 28070', targetExt: 'напр. 28071, 28072',
     singleNewLogin: 'напр. 28071', singleTemplateExt: 'напр. 28070',
     createTemplateExt: 'напр. 28070', createBulkList: '28071,Иван Иванов\\n28075,Мария Петрова',
-    deleteExt: 'напр. 28071, 28075',
+    deleteExt: 'напр. 28071, 28075', passwordExt: 'напр. 28071, 28075',
+    groupNumber: 'напр. 21701', groupName: 'напр. BMW Astana - 21701', groupMembers: 'напр. 21703, 21704',
+    groupBulkList: '21701, BMW Astana - 21701: 21703, 21704 > 21700\\n28020, AST-AMP - 28020: 21322, 21323',
   },
 };
 
-function applyCityPlaceholders(city) {
+function applyCityFields(city) {
   for (const [id, text] of Object.entries(CITY_PLACEHOLDERS[city] || {})) {
     const el = document.getElementById(id);
     if (el) el.placeholder = text;
   }
+  // Parts only one city's template has (Astana's «если никто не ответил»).
+  document.querySelectorAll('[data-city-only]').forEach(el => {
+    el.hidden = el.dataset.cityOnly !== city;
+  });
 }
 
 document.querySelectorAll('.city-btn').forEach(btn => {
@@ -1088,10 +1218,10 @@ document.querySelectorAll('.city-btn').forEach(btn => {
     document.querySelectorAll('.city-btn').forEach(b => b.classList.remove('active'));
     btn.classList.add('active');
     selectedCity = btn.dataset.city;
-    applyCityPlaceholders(selectedCity);
+    applyCityFields(selectedCity);
   });
 });
-applyCityPlaceholders(selectedCity);
+applyCityFields(selectedCity);
 
 document.getElementById('btnSettingsSave').addEventListener('click', async () => {
   const msgEl = document.getElementById('settingsMsg');
@@ -1582,6 +1712,17 @@ function permissionsResultNote(result) {
   return result.permissions_copied ? ` · права: скопировано ${result.permissions_copied}` : '';
 }
 
+// A reset password as a result line: «общий» unless the device didn't get it.
+function newPasswordNote(result) {
+  if (result.devices_error) {
+    return `пароль пользователя: <b class="secret">${esc(result.new_password)}</b> · устройство НЕ обновлено: ${esc(result.devices_error)}`;
+  }
+  if (result.devices_updated && result.devices_updated.length === 0) {
+    return `пароль: <b class="secret">${esc(result.new_password)}</b> · устройств нет`;
+  }
+  return `общий пароль: <b class="secret">${esc(result.new_password)}</b>`;
+}
+
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
 }
@@ -1698,7 +1839,7 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
     if (r.ok) {
       const roleNames = r.plan.roles.map(x => x.name).join(', ') || '—';
       const licenseNames = r.plan.license.map(x => x.prod || x.id).join(', ') || '—';
-      const passwordNote = r.plan.reset_password ? ' · пароль: будет сброшен' : ' · пароль: не меняется';
+      const passwordNote = r.plan.reset_password ? ' · пароль: будет сброшен (общий)' : ' · пароль: не меняется';
       const permissionsNote = ' · права: ' + (r.plan.copy_permissions ? permissionsText(r.plan.permissions, 'уже как у образца') : 'не копируются');
       return `<div class="field list-ok"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
         `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}${passwordNote}${permissionsNote}</span></div>`;
@@ -1725,8 +1866,8 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
   for (const r of toApply) {
     try {
       const result = await api('/api/webitel/execute', {plan: r.plan});
-      const passwordNote = result.new_password ? ` · новый пароль: <b class="secret">${esc(result.new_password)}</b>` : '';
-      results.push(`<div class="field ${result.permissions_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
+      const passwordNote = result.new_password ? ' · ' + newPasswordNote(result) : '';
+      results.push(`<div class="field ${result.permissions_error || result.devices_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
         `<span class="v status">✓ обновлён${passwordNote}${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
       results.push(`<div class="field list-error"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
@@ -1832,12 +1973,91 @@ document.getElementById('btnDeleteExecute').addEventListener('click', async () =
   btn.disabled = false;
 });
 
+let currentPasswordPlans = [];  // [{ok: true, plan} | {ok: false, extension, error}]
+
+document.getElementById('btnPasswordPlan').addEventListener('click', async () => {
+  const extensions = splitNumbers(document.getElementById('passwordExt').value);
+  const msgEl = document.getElementById('passwordPlanMsg');
+  const listEl = document.getElementById('passwordPlanList');
+  const confirmRow = document.getElementById('passwordConfirmRow');
+  listEl.innerHTML = '';
+  confirmRow.hidden = true;
+  document.getElementById('passwordExecuteMsg').textContent = '';
+  currentPasswordPlans = [];
+
+  if (extensions.length === 0) {
+    msgEl.className = 'msg error';
+    msgEl.textContent = 'Укажите хотя бы один логин/добавочный';
+    return;
+  }
+
+  msgEl.className = 'msg info';
+  msgEl.textContent = `Ищу ${extensions.length} — только чтение...`;
+
+  for (const extension of extensions) {
+    try {
+      const plan = await api('/api/webitel/password_plan', {extension, city: selectedCity});
+      currentPasswordPlans.push({ok: true, plan});
+    } catch (e) {
+      currentPasswordPlans.push({ok: false, extension, error: e.message});
+    }
+  }
+
+  const okCount = currentPasswordPlans.filter(r => r.ok).length;
+  msgEl.textContent = `Найдено: ${okCount} из ${extensions.length}. Ошибки ниже, если есть.`;
+  listEl.innerHTML = currentPasswordPlans.map(r => {
+    if (!r.ok) {
+      return `<div class="field list-error"><span class="k">${esc(r.extension)}</span><span class="v">${esc(r.error)}</span></div>`;
+    }
+    const devices = r.plan.devices.map(d => esc(d.name || d.id)).join(', ');
+    const presence = r.plan.presence || [];
+    const statusLine = presence.length
+      ? `<span class="presence active">Сейчас в сети — ${presence.map(esc).join(', ')}. Телефон отключится, пока на нём не введут новый пароль.</span>`
+      : `<span class="presence idle">Статус: не в сети</span>`;
+    return `<div class="field ${presence.length ? 'list-warn' : 'list-ok'}"><span class="k">${esc(r.plan.name)} (${esc(r.plan.username || r.plan.extension)})</span>` +
+      `<span class="v status">✓ ${devices ? 'устройство: ' + devices : 'устройств нет — сменится только пароль пользователя'}${statusLine}</span></div>`;
+  }).join('');
+
+  document.getElementById('btnPasswordExecute').textContent = `Подтвердить и сбросить (${okCount})`;
+  confirmRow.hidden = okCount === 0;
+});
+
+document.getElementById('btnPasswordExecute').addEventListener('click', async () => {
+  const toReset = currentPasswordPlans.filter(r => r.ok);
+  if (toReset.length === 0) return;
+  const msgEl = document.getElementById('passwordExecuteMsg');
+  const btn = document.getElementById('btnPasswordExecute');
+  const label = r => `${r.plan.name} (${r.plan.username || r.plan.extension})`;
+  if (!confirm(`Сбросить пароль ${toReset.length}:\\n${toReset.map(label).join('\\n')}\\n\\nНовый пароль будет у пользователя и его устройства.`)) return;
+  btn.disabled = true;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Сбрасываю...';
+  const results = [];
+  for (const r of toReset) {
+    try {
+      const result = await api('/api/webitel/password_execute', {plan: r.plan});
+      results.push(`<div class="field ${result.devices_error ? 'list-warn' : 'list-ok'}"><span class="k">${esc(label(r))}</span>` +
+        `<span class="v status">✓ ${newPasswordNote(result)}</span></div>`);
+    } catch (e) {
+      results.push(`<div class="field list-error"><span class="k">${esc(label(r))}</span><span class="v">${esc(e.message)}</span></div>`);
+    }
+  }
+  // Done with this plan: confirming it again would reset everyone once more.
+  currentPasswordPlans = [];
+  document.getElementById('passwordConfirmRow').hidden = true;
+  msgEl.className = 'msg info';
+  msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
+  btn.disabled = false;
+});
+
 document.querySelectorAll('.tab-btn').forEach(tabBtn => {
   tabBtn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    // Only this card's tabs: «Создать» and «Группы» each have their own.
+    const card = tabBtn.closest('.card-body');
+    card.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
     tabBtn.classList.add('active');
     const target = tabBtn.dataset.tab;
-    document.querySelectorAll('.tab-panel').forEach(panel => {
+    card.querySelectorAll('.tab-panel').forEach(panel => {
       panel.hidden = panel.dataset.panel !== target;
     });
   });
@@ -1875,7 +2095,7 @@ document.getElementById('btnCreatePlanSingle').addEventListener('click', async (
       <div class="field"><span class="k">Group → будет</span><span class="v">${plan.group || '—'}</span></div>
       <div class="field"><span class="k">Permissions → будет</span><span class="v">${plan.copy_permissions ? permissionsText(plan.permissions, 'у образца нет прав для ролей') : 'не копируются (галочка не отмечена)'}</span></div>
       <div class="field"><span class="k">Устройство (SIP)</span><span class="v">${plan.new_extension} — создастся вместе с пользователем</span></div>
-      <div class="field"><span class="k">Пароль</span><span class="v">сгенерируется при создании, постоянный (без принудительной смены)</span></div>
+      <div class="field"><span class="k">Пароль</span><span class="v">общий, сгенерируется при создании, постоянный (без принудительной смены)</span></div>
     `;
     cardEl.hidden = false;
     confirmRow.hidden = false;
@@ -1896,7 +2116,7 @@ document.getElementById('btnCreateExecuteSingle').addEventListener('click', asyn
   try {
     const result = await api('/api/webitel/create_execute', {plan: currentCreatePlanSingle});
     msgEl.className = 'msg info';
-    msgEl.innerHTML = `Готово. ${result.name} (${result.extension}) создан. Временный пароль: <b>${result.temporary_password}</b>${permissionsResultNote(result)}`;
+    msgEl.innerHTML = `Готово. ${result.name} (${result.extension}) создан. Общий пароль: <b>${result.temporary_password}</b>${permissionsResultNote(result)}`;
   } catch (e) {
     msgEl.textContent = 'Ошибка: ' + e.message;
     msgEl.className = 'msg error';
@@ -2034,7 +2254,7 @@ document.getElementById('btnCreateExecute').addEventListener('click', async () =
     try {
       const result = await api('/api/webitel/create_execute', {plan: r.plan});
       results.push(`<div class="field ${result.permissions_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v status">✓ пароль: ${result.temporary_password}${permissionsResultNote(result)}</span></div>`);
+        `<span class="v status">✓ общий пароль: ${result.temporary_password}${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
       results.push(`<div class="field list-error"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
         `<span class="v">${e.message}</span></div>`);
@@ -2043,6 +2263,134 @@ document.getElementById('btnCreateExecute').addEventListener('click', async () =
   msgEl.className = 'msg info';
   msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
   btn.disabled = false;
+});
+
+// «Группы»: a group number is a Flow schema from the operator's template
+// plus a Dialplan route sending that number to it — only the number, a name
+// and the member numbers are typed. Both tabs share this flow.
+const groupPlans = {Single: [], Bulk: []};  // [{ok: true, plan} | {ok: false, name, error}]
+const GROUP_LINE_FORMAT = 'формат строки «номер, название: участники»';
+
+function splitNumbers(text) {
+  return text.split(/[\\s,;]+/).filter(x => x.length > 0);
+}
+
+function readGroupEntries(tab) {
+  if (tab === 'Single') {
+    const number = document.getElementById('groupNumber').value.trim();
+    const name = document.getElementById('groupName').value.trim();
+    const extensions = splitNumbers(document.getElementById('groupMembers').value);
+    // Hidden outside Astana, so whatever was typed there doesn't count.
+    const fallbackInput = document.getElementById('groupFallback');
+    const fallback = fallbackInput.closest('[data-city-only]').hidden ? '' : fallbackInput.value.trim();
+    return number || name || extensions.length ? [{number, name, extensions, fallback}] : [];
+  }
+  return document.getElementById('groupBulkList').value.split('\\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .map(line => {
+      const colon = line.indexOf(':');
+      const comma = line.indexOf(',');
+      if (colon < 0 || comma < 0 || comma > colon) return {name: line, error: 'не понял строку — ' + GROUP_LINE_FORMAT};
+      const [members, fallback = ''] = line.slice(colon + 1).split('>');
+      return {
+        number: line.slice(0, comma).trim(),
+        name: line.slice(comma + 1, colon).trim(),
+        extensions: splitNumbers(members),
+        fallback: fallback.trim(),
+      };
+    });
+}
+
+async function buildGroupPlans(tab) {
+  const entries = readGroupEntries(tab);
+  const msgEl = document.getElementById('groupPlanMsg' + tab);
+  const listEl = document.getElementById('groupPlanList' + tab);
+  const confirmRow = document.getElementById('groupConfirmRow' + tab);
+  listEl.innerHTML = '';
+  confirmRow.hidden = true;
+  document.getElementById('groupExecuteMsg' + tab).textContent = '';
+  groupPlans[tab] = [];
+
+  if (entries.length === 0) {
+    msgEl.className = 'msg error';
+    msgEl.textContent = tab === 'Single' ? 'Укажите групповой номер, название и участников' : 'Добавьте хотя бы одну группу — ' + GROUP_LINE_FORMAT;
+    return;
+  }
+
+  msgEl.className = 'msg info';
+  msgEl.textContent = `Строю план для ${entries.length} — только чтение...`;
+
+  for (const entry of entries) {
+    if (entry.error) {
+      groupPlans[tab].push({ok: false, name: entry.name, error: entry.error});
+      continue;
+    }
+    try {
+      const plan = await api('/api/webitel/group_plan', {
+        number: entry.number, name: entry.name, extensions: entry.extensions, fallback: entry.fallback, city: selectedCity,
+      });
+      groupPlans[tab].push({ok: true, plan});
+    } catch (e) {
+      groupPlans[tab].push({ok: false, name: entry.name, error: e.message});
+    }
+  }
+
+  const okCount = groupPlans[tab].filter(r => r.ok).length;
+  msgEl.textContent = tab === 'Single' ? '' : `Готово: ${okCount} из ${entries.length} — план построен. Ошибки ниже, если есть.`;
+  listEl.innerHTML = groupPlans[tab].map(r => {
+    if (!r.ok) {
+      return `<div class="field list-error"><span class="k">${esc(r.name || '—')}</span><span class="v">${esc(r.error)}</span></div>`;
+    }
+    const members = r.plan.members.map(m => esc(m.extension) + (m.name ? ' — ' + esc(m.name) : '')).join(', ');
+    const numberWarning = r.plan.number_user
+      ? `<span class="presence active">Номер ${esc(r.plan.number)} — это пользователь ${esc(r.plan.number_user)}: его звонки пойдут в группу.</span>`
+      : '';
+    return `<div class="field ${r.plan.number_user ? 'list-warn' : 'list-ok'}"><span class="k">${esc(r.plan.number)} → ${esc(r.plan.name)}</span>` +
+      `<span class="v status">✓ маршрут ^${esc(r.plan.number)}$ на новую схему · звонят сразу все ${r.plan.members.length}, ${esc(r.plan.ring_seconds)} с: ${members}` +
+      (r.plan.fallback ? ` · никто не ответил — на ${esc(r.plan.fallback)}${r.plan.fallback_name ? ' — ' + esc(r.plan.fallback_name) : ''}, если свободен` : '') +
+      `${numberWarning}</span></div>` +
+      `<details class="schema-json"><summary>JSON схемы</summary><pre>${esc(JSON.stringify(r.plan.schema, null, 2))}</pre></details>`;
+  }).join('');
+
+  confirmRow.hidden = okCount === 0;
+}
+
+async function executeGroupPlans(tab) {
+  const toCreate = groupPlans[tab].filter(r => r.ok);
+  if (toCreate.length === 0) return;
+  const msgEl = document.getElementById('groupExecuteMsg' + tab);
+  const btn = document.getElementById('btnGroupExecute' + tab);
+  const city = WEBITEL_CITY_NAMES[toCreate[0].plan.city] || toCreate[0].plan.city;
+  const lines = toCreate.map(r => `${r.plan.number} → ${r.plan.name}`).join('\\n');
+  if (!confirm(`Создать в Webitel ${city} схему Flow и маршрут Dialplan для ${toCreate.length}?\\n${lines}`)) return;
+  btn.disabled = true;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Создаю...';
+  const results = [];
+  for (const r of toCreate) {
+    const label = `<span class="k">${esc(r.plan.number)} → ${esc(r.plan.name)}</span>`;
+    try {
+      const result = await api('/api/webitel/group_execute', {plan: r.plan});
+      const schemaNote = `схема создана${result.id ? ' (id ' + esc(result.id) + ')' : ''}`;
+      results.push(result.route_error
+        ? `<div class="field list-warn">${label}<span class="v status">✓ ${schemaNote} · маршрут НЕ создан: ${esc(result.route_error)}</span></div>`
+        : `<div class="field list-ok">${label}<span class="v status">✓ ${schemaNote} · маршрут ^${esc(r.plan.number)}$ создан</span></div>`);
+    } catch (e) {
+      results.push(`<div class="field list-error">${label}<span class="v">${esc(e.message)}</span></div>`);
+    }
+  }
+  // Done with this plan: confirming it again would only meet «уже есть».
+  groupPlans[tab] = [];
+  document.getElementById('groupConfirmRow' + tab).hidden = true;
+  msgEl.className = 'msg info';
+  msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
+  btn.disabled = false;
+}
+
+['Single', 'Bulk'].forEach(tab => {
+  document.getElementById('btnGroupPlan' + tab).addEventListener('click', () => buildGroupPlans(tab));
+  document.getElementById('btnGroupExecute' + tab).addEventListener('click', () => executeGroupPlans(tab));
 });
 
 // A plan is for the fields and checkboxes as they were at «Показать план»:
@@ -2081,6 +2429,21 @@ dropPlanOnChange(['createTemplateExt', 'createBulkList', 'bulkCopyPermissionsChe
   if (currentCreatePlans.length === 0) return;
   currentCreatePlans = [];
   showStalePlan('createPlanMsg', 'createPlanList', 'createConfirmRow');
+});
+dropPlanOnChange(['groupNumber', 'groupName', 'groupMembers', 'groupFallback'], () => {
+  if (groupPlans.Single.length === 0) return;
+  groupPlans.Single = [];
+  showStalePlan('groupPlanMsgSingle', 'groupPlanListSingle', 'groupConfirmRowSingle');
+});
+dropPlanOnChange(['passwordExt'], () => {
+  if (currentPasswordPlans.length === 0) return;
+  currentPasswordPlans = [];
+  showStalePlan('passwordPlanMsg', 'passwordPlanList', 'passwordConfirmRow');
+});
+dropPlanOnChange(['groupBulkList'], () => {
+  if (groupPlans.Bulk.length === 0) return;
+  groupPlans.Bulk = [];
+  showStalePlan('groupPlanMsgBulk', 'groupPlanListBulk', 'groupConfirmRowBulk');
 });
 </script>
 </body>
@@ -2213,9 +2576,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             _audit(op, self._client_ip(), self.path, {**details, "ok": False, "error": str(exc)[:300]})
             raise
-        if isinstance(result, dict) and result.get("permissions_error"):
-            # The main change went through; only copying permissions failed.
-            details["permissions_error"] = str(result["permissions_error"])[:300]
+        for key in ("permissions_error", "route_error", "devices_error"):
+            if isinstance(result, dict) and result.get(key):
+                # The main change went through; only a follow-up step failed.
+                details[key] = str(result[key])[:300]
         _audit(op, self._client_ip(), self.path, {**details, "ok": True})
         return result
 
@@ -2510,6 +2874,63 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
                 result = self._run_audited(op, plan, lambda: actions.execute_create_plan(plan))
+                self._send_json(200, result)
+                return
+
+            if self.path == "/api/webitel/password_plan":
+                extension = str(body.get("extension") or "").strip()
+                city = str(body.get("city") or "almaty").strip() or "almaty"
+                if not extension:
+                    self._send_json(400, {"error": "extension is required"})
+                    return
+                actions = _get_webitel_actions(op, city)
+                plan = actions.build_password_plan(extension)
+                plan["city"] = city
+                self._send_json(200, plan)
+                return
+
+            if self.path == "/api/webitel/password_execute":
+                plan = body.get("plan")
+                if not plan:
+                    self._send_json(400, {"error": "plan is required"})
+                    return
+                actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
+                result = self._run_audited(op, plan, lambda: actions.execute_password_plan(plan))
+                self._send_json(200, result)
+                return
+
+            if self.path == "/api/webitel/group_plan":
+                from crm_ai_agent.adapters.webitel_api.actions import GROUP_RING_SECONDS
+
+                name = str(body.get("name") or "").strip()
+                number = str(body.get("number") or "").strip()
+                fallback = str(body.get("fallback") or "").strip()
+                extensions = body.get("extensions")
+                city = str(body.get("city") or "almaty").strip() or "almaty"
+                if not isinstance(extensions, list):
+                    extensions = []
+                extensions = [str(x).strip() for x in extensions if str(x).strip()]
+                if not name or not number or not extensions:
+                    self._send_json(400, {"error": "Укажите групповой номер, название и хотя бы одного участника"})
+                    return
+                if city not in GROUP_RING_SECONDS:
+                    self._send_json(400, {"error": "Для этого города шаблона группового номера пока нет"})
+                    return
+                actions = _get_webitel_actions(op, city)
+                plan = actions.build_group_plan(
+                    city=city, name=name, number=number, extensions=extensions, fallback=fallback,
+                )
+                plan["city"] = city
+                self._send_json(200, plan)
+                return
+
+            if self.path == "/api/webitel/group_execute":
+                plan = body.get("plan")
+                if not plan:
+                    self._send_json(400, {"error": "plan is required"})
+                    return
+                actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
+                result = self._run_audited(op, plan, lambda: actions.execute_group_plan(plan))
                 self._send_json(200, result)
                 return
 

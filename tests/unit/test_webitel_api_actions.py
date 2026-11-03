@@ -9,7 +9,7 @@ import unittest
 from io import BytesIO
 from unittest.mock import patch
 
-from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions, WebitelApiError, generate_password
+from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions, WebitelApiError, generate_password, group_schema
 from crm_ai_agent.adapters.webitel_api.session import WebitelApiSession
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
 
@@ -52,6 +52,14 @@ class _FakeResponse:
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+
+def _device_write() -> list[_FakeResponse]:
+    """GET + PUT of TARGET_USER's device, which a password reset sets as well."""
+    return [
+        _FakeResponse({"id": "222222", "name": "10079", "account": "10079", "user": {"id": "9999", "name": "new employee"}}),
+        _FakeResponse({}),
+    ]
 
 
 def _actions() -> WebitelApiActions:
@@ -308,6 +316,7 @@ class TestExecutePlanWithPermissions(unittest.TestCase):
         mock_urlopen.side_effect = [
             _FakeResponse(TARGET_USER),
             _FakeResponse({"id": "9999"}),
+            *_device_write(),
             _acl(),
             urllib.error.HTTPError(url="x", code=403, msg="Forbidden", hdrs=None, fp=BytesIO(b"no acl rights")),
             _FakeResponse({}),
@@ -406,7 +415,7 @@ class TestExecutePlan(unittest.TestCase):
         (never a hardcoded one) and returns it as new_password so it can
         be shown to the approver once."""
         plan = {"target_id": "9999", "roles": [], "license": [], "group": "x", "reset_password": True}
-        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({"id": "9999"})]
+        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({"id": "9999"}), *_device_write()]
 
         result = _actions().execute_plan(plan)
 
@@ -419,8 +428,8 @@ class TestExecutePlan(unittest.TestCase):
     def test_execute_reset_password_generates_different_values_each_call(self, mock_urlopen) -> None:
         plan = {"target_id": "9999", "roles": [], "license": [], "group": "x", "reset_password": True}
         mock_urlopen.side_effect = [
-            _FakeResponse(TARGET_USER), _FakeResponse({}),
-            _FakeResponse(TARGET_USER), _FakeResponse({}),
+            _FakeResponse(TARGET_USER), _FakeResponse({}), *_device_write(),
+            _FakeResponse(TARGET_USER), _FakeResponse({}), *_device_write(),
         ]
 
         result1 = _actions().execute_plan(plan)
@@ -969,6 +978,401 @@ class TestExecuteDeletePlan(unittest.TestCase):
         ]
         with self.assertRaises(WebitelApiError):
             _actions().execute_delete_plan(plan)
+
+
+class TestPasswordReset(unittest.TestCase):
+    """The device write itself is patched out here: what matters is that
+    user and devices end up with one and the same password."""
+
+    TEST_USER = {"id": "6197", "name": "TEST1", "username": "30120", "extension": "30120", "roles": [{"id": "28"}],
+                 "device": {"id": "150571", "name": "30120"}, "devices": [{"id": "150571", "name": "30120"}]}
+    PLAN = {"extension": "30120", "id": "6197", "name": "TEST1", "devices": [{"id": "150571", "name": "30120"}], "city": "almaty"}
+
+    def _found(self, user: dict | None = None) -> list[_FakeResponse]:
+        user = user or self.TEST_USER
+        return [_FakeResponse({"items": [{"id": user["id"], "extension": user["extension"]}]}), _FakeResponse(user)]
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_plan_lists_the_devices_and_who_is_online(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(),
+            _FakeResponse({"items": [{"id": "6197", "extension": "30120", "presence": {"status": "{sip}"}}]}),
+        ]
+        plan = _actions().build_password_plan("30120")
+        self.assertEqual((plan["devices"], plan["presence"]), ([{"id": "150571", "name": "30120"}], ["SIP"]))
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch.object(WebitelApiActions, "_set_device_password")
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_user_and_device_get_the_same_new_password(self, mock_urlopen, set_device) -> None:
+        mock_urlopen.side_effect = [*self._found(), _FakeResponse({})]
+        result = _actions().execute_password_plan(self.PLAN)
+
+        put = mock_urlopen.call_args_list[2].args[0]
+        sent = json.loads(put.data)
+        self.assertEqual((put.get_method(), put.full_url), ("PUT", "https://wtl-alm.astana-motors.kz/api/users/6197"))
+        self.assertRegex(sent["password"], _PASSWORD_FORMAT)
+        self.assertEqual({k: v for k, v in sent.items() if k != "password"}, self.TEST_USER)
+        set_device.assert_called_once_with("150571", sent["password"])
+        self.assertEqual((result["new_password"], result["devices_updated"]), (sent["password"], ["30120"]))
+
+    @patch.object(WebitelApiActions, "_set_device_password", side_effect=WebitelApiError("HTTP 400"))
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_failed_device_keeps_the_users_new_password(self, mock_urlopen, _set_device) -> None:
+        mock_urlopen.side_effect = [*self._found(), _FakeResponse({})]
+        result = _actions().execute_password_plan(self.PLAN)
+        self.assertRegex(result["new_password"], _PASSWORD_FORMAT)
+        self.assertIn("HTTP 400", result["devices_error"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_when_the_extension_now_belongs_to_someone_else(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = self._found({**self.TEST_USER, "id": "7000"})
+        with self.assertRaises(WebitelApiError):
+            _actions().execute_password_plan(self.PLAN)
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch.object(WebitelApiActions, "_set_device_password")
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_copys_reset_checkbox_also_sets_the_device(self, mock_urlopen, set_device) -> None:
+        plan = {"target_id": "9999", "roles": [], "license": [], "group": "x", "reset_password": True}
+        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({})]
+        result = _actions().execute_plan(plan)
+        set_device.assert_called_once_with("222222", result["new_password"])
+        self.assertEqual(result["devices_updated"], ["10079"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_device_write_sends_what_webitels_devices_form_sends(self, mock_urlopen) -> None:
+        """Body as captured from the form's «Save» on test device 10085
+        (2026-11-03); the GET leaves empty fields out."""
+        mock_urlopen.side_effect = [
+            _FakeResponse({"id": "150647", "name": "10085", "account": "10085", "user": {"id": "6270", "name": "TEST"},
+                           "logged_in": "1792387450078"}),
+            _FakeResponse({}),
+        ]
+        _actions()._set_device_password("150647", "N3wPassw0rdAbcde")
+
+        put = mock_urlopen.call_args_list[1].args[0]
+        self.assertEqual((put.get_method(), put.full_url), ("PUT", "https://wtl-alm.astana-motors.kz/api/devices/150647"))
+        self.assertEqual(json.loads(put.data), {
+            "name": "10085", "account": "10085", "password": "N3wPassw0rdAbcde", "user": {"id": "6270", "name": "TEST"},
+            "phone": {}, "ip": "", "brand": "", "model": "", "mac": "", "hotdesks": [], "hotdesk": False,
+        })
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_device_write_keeps_a_desk_phones_details(self, mock_urlopen) -> None:
+        desk_phone = {"name": "10090", "account": "10090", "user": {"id": "7", "name": "X"}, "phone": {"id": "3", "name": "Yealink"},
+                      "ip": "10.0.0.5", "brand": "Yealink", "model": "T46U", "mac": "80:5e:c0:00:00:01",
+                      "hotdesks": ["101"], "hotdesk": True}
+        mock_urlopen.side_effect = [_FakeResponse({"id": "9", "logged_in": "1", **desk_phone}), _FakeResponse({})]
+        _actions()._set_device_password("9", "N3wPassw0rdAbcde")
+        self.assertEqual(json.loads(mock_urlopen.call_args_list[1].args[0].data), {**desk_phone, "password": "N3wPassw0rdAbcde"})
+
+    @patch.object(WebitelApiActions, "_set_device_password")
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_copy_without_reset_leaves_devices_alone(self, mock_urlopen, set_device) -> None:
+        plan = {"target_id": "9999", "roles": [], "license": [], "group": "x"}
+        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({})]
+        result = _actions().execute_plan(plan)
+        set_device.assert_not_called()
+        self.assertNotIn("devices_updated", result)
+
+
+# The operator's group number template exactly as pasted from Webitel's Flow
+# code editor (2026-11-02, Almaty).
+_OPERATOR_GROUP_TEMPLATE = json.loads("""[
+  {"set": {"continue_on_fail": "true", "hangup_after_bridge": "true"}},
+  {"ringback": {"all": true,
+                "call": {"name": "%(1000,6000,425);loops=-1", "type": "tone"},
+                "hold": {"name": "%(1000,6000,425);loops=-1", "type": "tone"},
+                "transfer": {"id": 488}}},
+  {"ringReady": ""},
+  {"preAnswer": ""},
+  {"recordSession": {"action": "start", "bridged": true, "followTransfer": true,
+                     "minSec": 2, "stereo": true, "type": "mp3"}},
+  {"log": ">> ALM-OP-30151 <<<"},
+  {"bridge": {"endpoints": [
+      {"extension": "30152", "parameters": {"leg_timeout": "30"}, "type": "user"},
+      {"extension": "30153", "parameters": {"leg_timeout": "30"}, "type": "user"},
+      {"extension": "30154", "parameters": {"leg_timeout": "30"}, "type": "user"},
+      {"extension": "30155", "parameters": {"leg_timeout": "30"}, "type": "user"},
+      {"extension": "30156", "parameters": {"leg_timeout": "30"}, "type": "user"},
+      {"extension": "30157", "parameters": {"leg_timeout": "30"}, "type": "user"}],
+    "strategy": "fork"}},
+  {"bridge": {"bridged": [{"log": "Ok call is bridged"}, {"set": {"busy": "2"}}, {"log": "END call is bridged"}]}},
+  {"hangup": ""}
+]""")
+
+
+def _astana_members(*extensions: str) -> str:
+    return ", ".join(
+        f'{{"extension": "{e}", "parameters": {{"leg_timeout": "15"}}, "type": "user"}}' for e in extensions
+    )
+
+
+_ASTANA_START = """
+  {"set": {"continue_on_fail": "true", "hangup_after_bridge": "true"}},
+  {"ringReady": ""},
+  {"preAnswer": ""},
+  {"recordSession": {"action": "start", "bridged": true, "followTransfer": true,
+                     "minSec": 2, "stereo": true, "type": "mp3"}},"""
+
+# Both of the operator's Astana group schemas as pasted (2026-11-03): one hands
+# an unanswered call on to 21700 (an int there, and only if 21700 is idle),
+# the other just ends.
+_ASTANA_WITH_FALLBACK = json.loads("[" + _ASTANA_START + """
+  {"log": ">> BMW Astana - 21701 <<<"},
+  {"bridge": {"endpoints": [""" + _astana_members("21703", "21704", "21705", "21706", "21707") + """],
+              "strategy": "fork"}},
+  {"bridge": {"endpoints": [{"extension": 21700, "idle": true, "type": "user"}]}},
+  {"hangup": ""}
+]""")
+_ASTANA_WITHOUT_FALLBACK = json.loads("[" + _ASTANA_START + """
+  {"log": ">> AST-AMP - 28020 <<<"},
+  {"bridge": {"endpoints": [""" + _astana_members(*(str(n) for n in range(21322, 21330))) + """],
+              "strategy": "fork"}},
+  {"hangup": ""}
+]""")
+
+
+def _user_found(extension: str, name: str) -> list[_FakeResponse]:
+    """get_raw_user's two GETs for an existing user."""
+    return [
+        _FakeResponse({"items": [{"id": "u" + extension, "extension": extension}]}),
+        _FakeResponse({"id": "u" + extension, "extension": extension, "name": name}),
+    ]
+
+
+class TestGroupSchema(unittest.TestCase):
+    def test_matches_the_operators_template(self) -> None:
+        schema = group_schema("almaty", "ALM-OP-30151", ["30152", "30153", "30154", "30155", "30156", "30157"])
+        self.assertEqual(schema, _OPERATOR_GROUP_TEMPLATE)
+
+    def test_only_name_and_members_change(self) -> None:
+        schema = group_schema("almaty", "Касса", ["10087"])
+        self.assertEqual(schema[5], {"log": ">> Касса <<<"})
+        self.assertEqual([e["extension"] for e in schema[6]["bridge"]["endpoints"]], ["10087"])
+        template = [step for i, step in enumerate(_OPERATOR_GROUP_TEMPLATE) if i not in (5, 6)]
+        self.assertEqual([step for i, step in enumerate(schema) if i not in (5, 6)], template)
+
+    def test_astana_with_a_fallback_matches_the_operators_schema(self) -> None:
+        schema = group_schema("astana", "BMW Astana - 21701", ["21703", "21704", "21705", "21706", "21707"], "21700")
+        self.assertEqual(schema, _ASTANA_WITH_FALLBACK)
+
+    def test_astana_without_a_fallback_matches_the_operators_schema(self) -> None:
+        schema = group_schema("astana", "AST-AMP - 28020", [str(n) for n in range(21322, 21330)])
+        self.assertEqual(schema, _ASTANA_WITHOUT_FALLBACK)
+
+    def test_almatys_template_has_no_fallback(self) -> None:
+        with self.assertRaises(WebitelApiError):
+            group_schema("almaty", "G", ["30152"], "30100")
+
+    def test_a_city_without_a_template_is_refused(self) -> None:
+        with self.assertRaises(WebitelApiError):
+            group_schema("shymkent", "G", ["30152"])
+
+
+_NO_SCHEMA = {"items": [{"id": 12, "name": "ALM-OP-30151 old"}]}  # only a partial name match
+_NO_ROUTE = {"page": 1, "items": [{"id": 5, "name": "internal", "pattern": "^30[0-9]{3}$"}]}
+
+
+class TestFindRoute(unittest.TestCase):
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_reads_every_page_and_matches_the_exact_pattern(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse({"page": 1, "next": True, "items": [{"id": 1, "name": "a", "pattern": "^301510$"}]}),
+            _FakeResponse({"page": 2, "items": [{"id": 2, "name": "TEST-AUTO", "pattern": "^30151$"}]}),
+        ]
+        self.assertEqual(_actions().find_route("30151")["name"], "TEST-AUTO")
+        self.assertIn("page=2", mock_urlopen.call_args_list[1].args[0].full_url)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_none_when_no_route_has_it(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeResponse(_NO_ROUTE)
+        self.assertIsNone(_actions().find_route("30151"))
+
+
+class TestBuildGroupPlan(unittest.TestCase):
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_plan_lists_members_and_carries_the_schema(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA),
+            _FakeResponse(_NO_ROUTE),
+            *_user_found("30152", "Иван"),
+            *_user_found("30153", "Мария"),
+            _FakeResponse({"items": []}),  # the group number is nobody's extension
+        ]
+        plan = _actions().build_group_plan(
+            city="almaty", name="ALM-OP-30151", number="30151", extensions=["30152", "30153", "30152"],
+        )
+
+        self.assertEqual(plan["members"], [{"extension": "30152", "name": "Иван"}, {"extension": "30153", "name": "Мария"}])
+        self.assertEqual((plan["number"], plan["number_user"]), ("30151", ""))
+        self.assertEqual(plan["schema"], group_schema("almaty", "ALM-OP-30151", ["30152", "30153"]))
+        self.assertEqual(mock_urlopen.call_count, 7)  # the repeated 30152 is looked up once
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_flags_a_number_that_is_a_users_extension(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA), _FakeResponse(_NO_ROUTE), *_user_found("30152", "Иван"), *_user_found("30151", "Олег"),
+        ]
+        plan = _actions().build_group_plan(name="G", number="30151", extensions=["30152"], city="almaty")
+        self.assertEqual(plan["number_user"], "Олег")
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_only_digits_go_into_the_route_pattern(self, mock_urlopen) -> None:
+        for number in ("30.*", "301 51", "^30151$", "٣٠١٥١"):
+            with self.assertRaises(WebitelApiError, msg=number):
+                _actions().build_group_plan(name="G", number=number, extensions=["30152"], city="almaty")
+        mock_urlopen.assert_not_called()
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_the_group_number_among_its_members(self, mock_urlopen) -> None:
+        with self.assertRaises(WebitelApiError):
+            _actions().build_group_plan(name="G", number="30151", extensions=["30152", "30151"], city="almaty")
+        mock_urlopen.assert_not_called()
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_a_name_already_taken(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeResponse({"items": [{"id": 370, "name": "TEST-AUTO"}]})
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().build_group_plan(name="TEST-AUTO", number="30151", extensions=["30152"], city="almaty")
+        self.assertIn("уже есть", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_a_number_a_route_already_leads(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA),
+            _FakeResponse({"items": [{"id": 9, "name": "TEST-AUTO", "pattern": "^55555$"}]}),
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().build_group_plan(name="G", number="55555", extensions=["30152"], city="almaty")
+        self.assertIn("TEST-AUTO", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_names_every_missing_member_at_once(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA),
+            _FakeResponse(_NO_ROUTE),
+            _FakeResponse({"items": []}),  # 30158: no such user
+            *_user_found("30152", "Иван"),
+            _FakeResponse({"items": []}),  # 30159: no such user
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().build_group_plan(name="G", number="30151", extensions=["30158", "30152", "30159"], city="almaty")
+        self.assertIn("30158, 30159", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_astana_fallback_is_looked_up_and_shown(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA), _FakeResponse(_NO_ROUTE),
+            *_user_found("21703", "Иван"), *_user_found("21700", "Ресепшн"),
+            _FakeResponse({"items": []}),
+        ]
+        plan = _actions().build_group_plan(
+            city="astana", name="BMW Astana - 21701", number="21701", extensions=["21703"], fallback="21700",
+        )
+        self.assertEqual((plan["fallback"], plan["fallback_name"], plan["ring_seconds"]), ("21700", "Ресепшн", "15"))
+        self.assertEqual(plan["schema"], group_schema("astana", "BMW Astana - 21701", ["21703"], "21700"))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_missing_fallback_is_named_with_the_missing_members(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA), _FakeResponse(_NO_ROUTE),
+            _FakeResponse({"items": []}),  # 21709
+            _FakeResponse({"items": []}),  # 21799
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().build_group_plan(city="astana", name="G", number="21701", extensions=["21709"], fallback="21799")
+        self.assertIn("21709, 21799", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_bad_fallbacks_are_refused_before_any_request(self, mock_urlopen) -> None:
+        for city, fallback in (("astana", "21701"), ("astana", "021700"), ("astana", "2170*"), ("almaty", "30100")):
+            with self.assertRaises(WebitelApiError, msg=(city, fallback)):
+                _actions().build_group_plan(city=city, name="G", number="21701", extensions=["21703"], fallback=fallback)
+        mock_urlopen.assert_not_called()
+
+
+class TestExecuteGroupPlan(unittest.TestCase):
+    PLAN = {"name": "ALM-OP-30151", "number": "30151", "members": [{"extension": "30152", "name": "Иван"}],
+            "schema": [{"hangup": ""}], "city": "almaty"}
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_posts_the_schema_then_the_route_to_it(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA), _FakeResponse(_NO_ROUTE),
+            _FakeResponse({"id": 371, "name": "ALM-OP-30151"}),
+            _FakeResponse({"id": 88, "name": "ALM-OP-30151"}),
+        ]
+        result = _actions().execute_group_plan(self.PLAN)
+
+        schema_post, route_post = (c.args[0] for c in mock_urlopen.call_args_list[2:])
+        self.assertEqual((schema_post.get_method(), schema_post.full_url),
+                         ("POST", "https://wtl-alm.astana-motors.kz/api/routing/schema"))
+        self.assertEqual(json.loads(schema_post.data), {
+            "name": "ALM-OP-30151", "type": "voice", "editor": False,
+            "schema": group_schema("almaty", "ALM-OP-30151", ["30152"]), "payload": {}, "tags": [],
+        })
+        self.assertEqual((route_post.get_method(), route_post.full_url),
+                         ("POST", "https://wtl-alm.astana-motors.kz/api/routing/outbound/calls"))
+        self.assertEqual(json.loads(route_post.data), {
+            "name": "ALM-OP-30151",
+            "schema": {"type": "voice", "editor": False, "id": "371", "name": "ALM-OP-30151"},
+            "pattern": "^30151$",
+            "description": "",
+        })
+        self.assertEqual(result, {"id": 371, "name": "ALM-OP-30151", "number": "30151", "members": ["30152"], "route_id": 88})
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_failed_route_still_reports_the_created_schema(self, mock_urlopen) -> None:
+        import urllib.error
+
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA), _FakeResponse(_NO_ROUTE),
+            _FakeResponse({"id": 371}),
+            urllib.error.HTTPError(url="x", code=400, msg="Bad Request", hdrs=None, fp=BytesIO(b"bad pattern")),
+        ]
+        result = _actions().execute_group_plan(self.PLAN)
+        self.assertEqual(result["id"], 371)
+        self.assertIn("HTTP 400", result["route_error"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_when_the_name_was_taken_since_the_plan(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeResponse({"items": [{"id": 371, "name": "ALM-OP-30151"}]})
+        with self.assertRaises(WebitelApiError):
+            _actions().execute_group_plan(self.PLAN)
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_when_a_route_took_the_number_since_the_plan(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA),
+            _FakeResponse({"items": [{"id": 9, "name": "other", "pattern": "^30151$"}]}),
+        ]
+        with self.assertRaises(WebitelApiError):
+            _actions().execute_group_plan(self.PLAN)
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_tampered_number_never_reaches_the_pattern(self, mock_urlopen) -> None:
+        with self.assertRaises(WebitelApiError):
+            _actions().execute_group_plan({**self.PLAN, "number": ".*"})
+        mock_urlopen.assert_not_called()
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_astana_posts_its_own_template_with_the_fallback(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse(_NO_SCHEMA), _FakeResponse(_NO_ROUTE), _FakeResponse({"id": 55}), _FakeResponse({"id": 9}),
+        ]
+        plan = {"city": "astana", "name": "BMW Astana - 21701", "number": "21701", "fallback": "21700",
+                "members": [{"extension": e, "name": ""} for e in ("21703", "21704", "21705", "21706", "21707")]}
+        _actions().execute_group_plan(plan)
+        self.assertEqual(json.loads(mock_urlopen.call_args_list[2].args[0].data)["schema"], _ASTANA_WITH_FALLBACK)
 
 
 if __name__ == "__main__":
