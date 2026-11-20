@@ -216,6 +216,18 @@ class TestConsoleServer(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("шаблона", payload["error"])
 
+    def test_a_missing_number_comes_back_as_404_naming_it(self) -> None:
+        """So «Копировать» can tell a missing template from a missing target."""
+        from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
+
+        class _Actions:
+            def build_plan(self, **_: str) -> dict:
+                raise SubjectNotFoundError("no Webitel user found for extension='15215'", "15215")
+
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, payload = self._post("/api/webitel/plan", {"template_extension": "15200", "target_extension": "15215"})
+        self.assertEqual((status, payload["missing"]), (404, "15215"))
+
     def test_role_endpoints_need_a_name_and_a_plan(self) -> None:
         status, payload = self._post("/api/webitel/role_plan", {"name": " "})
         self.assertEqual(status, 400)

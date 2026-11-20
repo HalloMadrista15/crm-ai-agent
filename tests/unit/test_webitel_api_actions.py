@@ -134,8 +134,9 @@ class TestGetRawUser(unittest.TestCase):
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_raises_when_extension_not_found(self, mock_urlopen) -> None:
         mock_urlopen.return_value = _FakeResponse({"items": []})
-        with self.assertRaises(SubjectNotFoundError):
+        with self.assertRaises(SubjectNotFoundError) as ctx:
             _actions().get_raw_user("99999")
+        self.assertEqual(ctx.exception.subject, "99999")
 
 
 class TestBuildPlan(unittest.TestCase):

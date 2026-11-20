@@ -44,6 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
+from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
 from crm_ai_agent.webapp.crm_session import CrmSessionExpired, CrmSessionManager
 from crm_ai_agent.webapp.webitel_login import WEBITEL_CITY_KEYS, WebitelLoginJob, city_config, latest_screenshot
 
@@ -855,8 +856,8 @@ _INDEX_HTML = """<!doctype html>
       <div class="split-main">
         <div class="row">
           <div class="field-group">
-            <label class="field-label" for="targetExt">Кому скопировать (можно несколько через запятую)</label>
-            <input type="text" id="targetExt" placeholder="напр. 10079, 10080">
+            <label class="field-label" for="targetExt">Кому скопировать (через запятую, можно диапазон 15210-15220)</label>
+            <input type="text" id="targetExt" placeholder="напр. 10079, 10085-10090">
           </div>
         </div>
         <div class="row">
@@ -1227,7 +1228,7 @@ let selectedCity = 'almaty';
 // Astana operator isn't shown Almaty's 100xx extensions as the pattern.
 const CITY_PLACEHOLDERS = {
   almaty: {
-    templateExt: 'напр. 10078', targetExt: 'напр. 10079, 10080',
+    templateExt: 'напр. 10078', targetExt: 'напр. 10079, 10085-10090',
     singleNewLogin: 'напр. 10087', singleTemplateExt: 'напр. 10078',
     createTemplateExt: 'напр. 10078', createBulkList: '10087,Иван Иванов\\n10097,Мария Петрова',
     deleteExt: 'напр. 10087, 10097', passwordExt: 'напр. 10087, 10097',
@@ -1235,7 +1236,7 @@ const CITY_PLACEHOLDERS = {
     groupBulkList: '30151, ALM-OP-30151: 30152, 30153\\n30161, ALM-OP-30161: 30162, 30163',
   },
   astana: {
-    templateExt: 'напр. 28070', targetExt: 'напр. 28071, 28072',
+    templateExt: 'напр. 28070', targetExt: 'напр. 28071, 28075-28080',
     singleNewLogin: 'напр. 28071', singleTemplateExt: 'напр. 28070',
     createTemplateExt: 'напр. 28070', createBulkList: '28071,Иван Иванов\\n28075,Мария Петрова',
     deleteExt: 'напр. 28071, 28075', passwordExt: 'напр. 28071, 28075',
@@ -1835,12 +1836,33 @@ document.getElementById('btnReadTicket').addEventListener('click', async () => {
 
 let currentPlans = [];  // [{ok: true, plan} | {ok: false, target, error}]
 
+// Numbers typed into a field: separated by commas, spaces or new lines,
+// with ranges like 15210-15220 (both ends included). A range of more than
+// RANGE_LIMIT numbers is taken for a typo.
+const RANGE_LIMIT = 100;
+
+function expandNumbers(text) {
+  const numbers = [];
+  for (const token of text.replace(/\\s*-\\s*/g, '-').split(/[\\s,;]+/).filter(Boolean)) {
+    const range = token.match(/^(\\d+)-(\\d+)$/);
+    if (!range) {
+      numbers.push(token);
+      continue;
+    }
+    const [from, to] = [Number(range[1]), Number(range[2])].sort((a, b) => a - b);
+    if (to - from + 1 > RANGE_LIMIT) return {numbers: [], error: `Диапазон ${token} больше ${RANGE_LIMIT} номеров`};
+    for (let n = from; n <= to; n++) numbers.push(String(n));
+  }
+  return {numbers: [...new Set(numbers)]};
+}
+
 document.getElementById('btnPlan').addEventListener('click', async () => {
   const template_extension = document.getElementById('templateExt').value.trim();
-  const targets = document.getElementById('targetExt').value
-    .split(',')
-    .map(x => x.trim())
-    .filter(x => x.length > 0);
+  const typed = expandNumbers(document.getElementById('targetExt').value);
+  // The template among the targets (say, inside a range) is left out:
+  // copying it onto itself does nothing, and «Сбросить пароль» would reset it.
+  const targets = typed.numbers.filter(t => t !== template_extension);
+  const templateSkipped = targets.length < typed.numbers.length;
   const msgEl = document.getElementById('planMsg');
   const listEl = document.getElementById('planList');
   const confirmRow = document.getElementById('confirmRow');
@@ -1853,15 +1875,16 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
     msgEl.textContent = 'Укажите логин пользователя-образца';
     return;
   }
-  if (targets.length === 0) {
+  if (typed.error || targets.length === 0) {
     msgEl.className = 'msg error';
-    msgEl.textContent = 'Укажите, кому скопировать';
+    msgEl.textContent = typed.error || 'Укажите, кому скопировать';
     return;
   }
 
   msgEl.className = 'msg info';
   msgEl.textContent = `Строю план для ${targets.length} — только чтение...`;
 
+  const missing = [];
   for (const target_extension of targets) {
     try {
       const plan = await api('/api/webitel/plan', {
@@ -1871,12 +1894,27 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
       });
       currentPlans.push({ok: true, plan});
     } catch (e) {
+      const notFound = e.data && e.data.missing;
+      if (notFound && notFound === template_extension) {
+        currentPlans = [];
+        msgEl.className = 'msg error';
+        msgEl.textContent = `Образца ${template_extension} нет в Webitel`;
+        return;
+      }
+      if (notFound && notFound === target_extension) {
+        missing.push(target_extension);
+        continue;
+      }
       currentPlans.push({ok: false, target: target_extension, error: e.message});
     }
   }
 
   const okCount = currentPlans.filter(r => r.ok).length;
-  msgEl.textContent = `Готово: ${okCount} из ${targets.length} — план построен. Ошибки ниже, если есть.`;
+  msgEl.textContent = `Готово: ${okCount} из ${targets.length} — план построен.` +
+    (templateSkipped ? ` Образец ${template_extension} пропущен.` : '') + ' Ошибки ниже, если есть.';
+  const missingRow = missing.length
+    ? `<div class="field list-error"><span class="k">нет в Webitel</span><span class="v">${missing.map(esc).join(', ')}</span></div>`
+    : '';
   listEl.innerHTML = currentPlans.map(r => {
     if (r.ok) {
       const roleNames = r.plan.roles.map(x => x.name).join(', ') || '—';
@@ -1887,7 +1925,7 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
         `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}${passwordNote}${permissionsNote}</span></div>`;
     }
     return `<div class="field list-error"><span class="k">${r.target}</span><span class="v">${r.error}</span></div>`;
-  }).join('');
+  }).join('') + missingRow;
 
   if (okCount > 0) confirmRow.hidden = false;
 });
@@ -2296,8 +2334,8 @@ setupNeighbors({
   button: 'btnCopyNeighbors', radiusInput: 'copyNeighborsRadius', msg: 'copyNeighborsMsg', list: 'copyNeighborsList',
   templateInput: 'templateExt',
   // Around the first number to copy to; the others being set up aren't offered.
-  center: () => splitNumbers(document.getElementById('targetExt').value)[0] || '',
-  skip: () => splitNumbers(document.getElementById('targetExt').value),
+  center: () => expandNumbers(document.getElementById('targetExt').value).numbers[0] || '',
+  skip: () => expandNumbers(document.getElementById('targetExt').value).numbers,
   noCenterText: 'Сначала укажите, кому скопировать — соседей ищу вокруг первого номера',
 });
 
@@ -3093,6 +3131,10 @@ class Handler(BaseHTTPRequestHandler):
         except CrmSessionExpired as exc:
             # The page re-logs in by itself on this flag (remembered login).
             self._send_json(401, {"error": str(exc), "crm_session_expired": True})
+        except SubjectNotFoundError as exc:
+            # "missing" names the number, so the page can tell a missing
+            # template from a missing target.
+            self._send_json(404, {"error": str(exc), "missing": exc.subject})
         except Exception as exc:  # noqa: BLE001 — surface to the operator's browser, not a crash
             self._send_json(500, {"error": _operator_error_message(exc)})
 

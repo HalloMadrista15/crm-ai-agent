@@ -24,7 +24,12 @@ from crm_ai_agent.domain.entities import ResolvedEntity
 
 
 class SubjectNotFoundError(Exception):
-    pass
+    """``subject`` is what wasn't found (e.g. the extension), when known —
+    so a caller can tell which of several lookups came up empty."""
+
+    def __init__(self, message: str, subject: str = "") -> None:
+        super().__init__(message)
+        self.subject = subject
 
 
 @runtime_checkable

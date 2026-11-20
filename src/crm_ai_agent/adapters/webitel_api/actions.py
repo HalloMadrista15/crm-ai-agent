@@ -307,7 +307,7 @@ class WebitelApiActions:
         users = data if isinstance(data, list) else data.get("items", [])
         matches = [u for u in users if u.get("extension") == extension]
         if not matches:
-            raise SubjectNotFoundError(f"no Webitel user found for extension={extension!r}")
+            raise SubjectNotFoundError(f"no Webitel user found for extension={extension!r}", extension)
         return self._get(f"/api/users/{matches[0]['id']}")
 
     def find_neighbors(self, extension: str, *, radius: int = 2) -> list[dict[str, Any]]:
@@ -780,7 +780,7 @@ class WebitelApiActions:
         users = data if isinstance(data, list) else data.get("items", [])
         matches = [u for u in users if u.get("extension") == extension]
         if not matches:
-            raise SubjectNotFoundError(f"no Webitel user found for extension={extension!r}")
+            raise SubjectNotFoundError(f"no Webitel user found for extension={extension!r}", extension)
         presence = matches[0].get("presence")
         return presence.get("status") if presence else None
 
