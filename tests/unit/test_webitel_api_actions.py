@@ -1079,6 +1079,117 @@ class TestPasswordReset(unittest.TestCase):
         self.assertNotIn("devices_updated", result)
 
 
+_OBJECTS = {"items": [{"id": "1", "class": "roles"}, {"id": "2", "class": "users"}, {"id": "4", "class": "calls"}]}
+
+
+class TestRoles(unittest.TestCase):
+    """Request shapes as captured from Webitel's Roles form and Permissions →
+    Objects on test role «test» (id 6387, 2026-11-20)."""
+
+    PLAN = {"name": "user-TEST-ROLE", "city": "almaty"}
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_plan_shows_what_the_role_gets_and_where(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": [{"id": "6382", "name": "user-TEST-ROLE-2"}]}),  # only a partial name match
+            _FakeResponse(_OBJECTS),
+        ]
+        plan = _actions().build_role_plan("user-TEST-ROLE")
+        self.assertEqual(plan, {
+            "name": "user-TEST-ROLE",
+            "permissions": ["Playback record file"],
+            "applications": ["Agent Workspace", "Call History"],
+            "objects": [{"object": "users", "id": "2", "grants": "r"}, {"object": "calls", "id": "4", "grants": "xr"}],
+        })
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_objects_are_found_by_name_whatever_their_ids(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),
+            _FakeResponse({"items": [{"id": "12", "name": "calls"}, {"id": "11", "name": "users"}]}),
+        ]
+        plan = _actions().build_role_plan("R")
+        self.assertEqual([(o["object"], o["id"]) for o in plan["objects"]], [("users", "11"), ("calls", "12")])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_a_name_already_taken(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeResponse({"items": [{"id": "6387", "name": "test"}]})
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().build_role_plan("test")
+        self.assertIn("уже есть", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_when_an_object_is_missing(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [_FakeResponse({"items": []}), _FakeResponse({"items": [{"id": "2", "class": "users"}]})]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().build_role_plan("R")
+        self.assertIn("calls", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_creates_the_role_as_webitels_form_does_then_grants_it_on_objects(self, mock_urlopen) -> None:
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}), _FakeResponse(_OBJECTS),
+            _FakeResponse({"id": "6387", "name": "user-TEST-ROLE"}),
+            _acl(), _FakeResponse({}), _acl(_grant("6387", "user-TEST-ROLE", "r")),
+            _acl(), _FakeResponse({}), _acl(_grant("6387", "user-TEST-ROLE", "xr")),
+        ]
+        result = _actions().execute_role_plan(self.PLAN)
+
+        post = mock_urlopen.call_args_list[2].args[0]
+        self.assertEqual((post.get_method(), post.full_url), ("POST", "https://wtl-alm.astana-motors.kz/api/roles"))
+        self.assertEqual(json.loads(post.data), {
+            "name": "user-TEST-ROLE", "description": "",
+            "permissions": [{"id": "playback_record_file", "name": "Playback record file",
+                             "usage": "Grants permission to playback call-record files"}],
+            "metadata": {"access": {"agent": {"_enabled": True}, "history": {"_enabled": True}}},
+        })
+        self.assertEqual(_patches(mock_urlopen), [
+            ("https://wtl-alm.astana-motors.kz/api/objclass/2/acl", [{"grantee": 6387, "grants": "r"}]),
+            ("https://wtl-alm.astana-motors.kz/api/objclass/4/acl", [{"grantee": 6387, "grants": "xr"}]),
+        ])
+        self.assertEqual(result, {"id": "6387", "name": "user-TEST-ROLE"})
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_letters_webitel_already_set_are_cleared_before_the_planned_ones(self, mock_urlopen) -> None:
+        """The objects' PATCH flips letters like a user's does: Webitel's own
+        page put «r» on a newly added role, and sending «xr» on top would
+        take that «r» away."""
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}), _FakeResponse(_OBJECTS), _FakeResponse({"id": "6387"}),
+            _acl(_grant("6387", "R", "r")), _acl(_grant("6387", "R", "r")),  # users: already exactly «r»
+            _acl(_grant("6387", "R", "r")), _FakeResponse({}), _FakeResponse({}), _acl(_grant("6387", "R", "xr")),
+        ]
+        result = _actions().execute_role_plan({"name": "R"})
+        self.assertEqual(_patches(mock_urlopen), [
+            ("https://wtl-alm.astana-motors.kz/api/objclass/4/acl", [{"grantee": 6387, "grants": "r"}]),
+            ("https://wtl-alm.astana-motors.kz/api/objclass/4/acl", [{"grantee": 6387, "grants": "xr"}]),
+        ])
+        self.assertNotIn("objects_error", result)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_failed_object_grant_still_reports_the_created_role(self, mock_urlopen) -> None:
+        import urllib.error
+
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}), _FakeResponse(_OBJECTS), _FakeResponse({"id": "6387"}),
+            _acl(), _FakeResponse({}), _acl(_grant("6387", "R", "r")),
+            _acl(), urllib.error.HTTPError(url="x", code=403, msg="Forbidden", hdrs=None, fp=BytesIO(b"no")), _acl(),
+        ]
+        result = _actions().execute_role_plan({"name": "R"})
+        self.assertEqual(result["id"], "6387")
+        self.assertIn("calls", result["objects_error"])
+        self.assertIn("HTTP 403", result["objects_error"])
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_refuses_when_the_name_was_taken_since_the_plan(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = _FakeResponse({"items": [{"id": "6390", "name": "R"}]})
+        with self.assertRaises(WebitelApiError):
+            _actions().execute_role_plan({"name": "R"})
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+
 # The operator's group number template exactly as pasted from Webitel's Flow
 # code editor (2026-11-02, Almaty).
 _OPERATOR_GROUP_TEMPLATE = json.loads("""[

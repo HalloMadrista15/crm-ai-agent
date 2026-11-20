@@ -413,7 +413,7 @@ def _exposure_problem(host: str, shared: bool, tls: bool) -> str:
 # result's secrets (e.g. the temporary password a reset or create returns).
 _AUDIT_PLAN_FIELDS = (
     "city", "template_extension", "target_extension", "target_name", "copy_permissions", "permissions",
-    "new_username", "new_name", "new_extension", "extension", "name", "reset_password", "number", "members", "fallback", "devices",
+    "new_username", "new_name", "new_extension", "extension", "name", "reset_password", "number", "members", "fallback", "devices", "objects",
 )
 _audit_lock = threading.Lock()
 
@@ -563,6 +563,7 @@ _INDEX_HTML = """<!doctype html>
   .radius-label input{width:52px;padding:6px 8px;}
   .neighbor-meta{display:block;font-weight:400;font-size:12px;color:var(--text-faint);}
   .list .field.neighbor.picked{border-color:var(--good);background:var(--good-soft);}
+  .split-main .list:not(:empty) + .checkbox-line{margin-top:14px;}
   .form-submit{margin-top:18px;}
   .approvals{padding:12px 0 10px;}
   .approvals-title{font-size:11.5px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--text-faint);margin-bottom:8px;}
@@ -659,6 +660,7 @@ _INDEX_HTML = """<!doctype html>
       <button type="button" class="nav-link" data-section="delete">Удалить</button>
       <button type="button" class="nav-link" data-section="groups">Группы</button>
       <button type="button" class="nav-link" data-section="password">Пароль</button>
+      <button type="button" class="nav-link" data-section="roles">Роли</button>
     </div>
     <button type="button" class="nav-account-btn" data-section="account"><span class="status-dot" id="navLoginDot" title="CRM: не выполнен вход"></span>Вход и настройки</button>
   </div>
@@ -853,16 +855,24 @@ _INDEX_HTML = """<!doctype html>
       <div class="split-main">
         <div class="row">
           <div class="field-group">
-            <label class="field-label" for="templateExt">Логин пользователя-образца</label>
-            <input type="text" id="templateExt" placeholder="напр. 10078">
-          </div>
-        </div>
-        <div class="row">
-          <div class="field-group">
             <label class="field-label" for="targetExt">Кому скопировать (можно несколько через запятую)</label>
             <input type="text" id="targetExt" placeholder="напр. 10079, 10080">
           </div>
         </div>
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="templateExt">Логин пользователя-образца</label>
+            <input type="text" id="templateExt" placeholder="напр. 10078">
+          </div>
+        </div>
+        <div class="neighbors-row">
+          <button type="button" id="btnCopyNeighbors" class="ghost">Подобрать по соседним номерам</button>
+          <label class="radius-label" title="Сколько номеров смотреть в каждую сторону">±
+            <input type="text" id="copyNeighborsRadius" value="2" inputmode="numeric">
+          </label>
+        </div>
+        <div id="copyNeighborsMsg" class="msg info"></div>
+        <div id="copyNeighborsList" class="list"></div>
         <div class="checkbox-line">
           <label class="checkbox-row">
             <input type="checkbox" id="resetPasswordCheck">
@@ -1144,6 +1154,38 @@ _INDEX_HTML = """<!doctype html>
   </div>
   </section>
 
+  <section class="app-section" data-section-panel="roles" hidden>
+  <div class="steps">
+
+  <div class="card">
+    <div class="card-head"><h2>Webitel: роль</h2></div>
+    <div class="card-body split form-split">
+      <div class="split-main">
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="roleName">Название</label>
+            <input type="text" id="roleName" placeholder="напр. user-KRG-CAK-30500">
+          </div>
+        </div>
+        <div class="row">
+          <button id="btnRolePlan">Показать план</button>
+        </div>
+      </div>
+      <div class="split-side">
+        <div id="rolePlanMsg" class="msg info"></div>
+        <div id="rolePlanCard" class="result-card" hidden></div>
+        <div class="row" id="roleConfirmRow" hidden>
+          <button id="btnRoleExecute" class="danger">Подтвердить и создать</button>
+        </div>
+        <div id="roleExecuteMsg" class="msg info"></div>
+        <div class="split-placeholder">Здесь появится план. Роль не создаётся, пока вы не подтвердите.</div>
+      </div>
+    </div>
+  </div>
+
+  </div>
+  </section>
+
 </div>
 
 <script>
@@ -1163,7 +1205,7 @@ async function api(path, body) {
 }
 
 const navButtons = document.querySelectorAll('.nav-link, .nav-account-btn');
-const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password'];
+const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password', 'roles'];
 
 navButtons.forEach(btn => {
   btn.addEventListener('click', () => {
@@ -2050,6 +2092,68 @@ document.getElementById('btnPasswordExecute').addEventListener('click', async ()
   btn.disabled = false;
 });
 
+let currentRolePlan = null;
+
+// Letters on Permissions → Objects, as its columns name them.
+function objectGrantsLabel(grants) {
+  return [['x', 'Create'], ['r', 'Read'], ['w', 'Edit'], ['d', 'Delete']]
+    .filter(([letter]) => grants.includes(letter)).map(([, name]) => name).join(', ') || '—';
+}
+
+document.getElementById('btnRolePlan').addEventListener('click', async () => {
+  const name = document.getElementById('roleName').value.trim();
+  const msgEl = document.getElementById('rolePlanMsg');
+  const cardEl = document.getElementById('rolePlanCard');
+  const confirmRow = document.getElementById('roleConfirmRow');
+  cardEl.hidden = true;
+  confirmRow.hidden = true;
+  document.getElementById('roleExecuteMsg').textContent = '';
+  currentRolePlan = null;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Строю план (только чтение)...';
+  try {
+    const plan = await api('/api/webitel/role_plan', {name, city: selectedCity});
+    currentRolePlan = plan;
+    msgEl.textContent = '';
+    cardEl.innerHTML = `
+      <div class="field"><span class="k">Роль</span><span class="v">${esc(plan.name)}</span></div>
+      <div class="field"><span class="k">Role permissions</span><span class="v">${plan.permissions.map(esc).join(', ')}</span></div>
+      <div class="field"><span class="k">Applications</span><span class="v">${plan.applications.map(esc).join(', ')}</span></div>
+      ${plan.objects.map(o => `<div class="field"><span class="k">Objects: ${esc(o.object)}</span><span class="v">${objectGrantsLabel(o.grants)}</span></div>`).join('')}
+    `;
+    cardEl.hidden = false;
+    confirmRow.hidden = false;
+  } catch (e) {
+    msgEl.textContent = 'Ошибка: ' + e.message;
+    msgEl.className = 'msg error';
+  }
+});
+
+document.getElementById('btnRoleExecute').addEventListener('click', async () => {
+  if (!currentRolePlan) return;
+  const msgEl = document.getElementById('roleExecuteMsg');
+  const btn = document.getElementById('btnRoleExecute');
+  const city = WEBITEL_CITY_NAMES[currentRolePlan.city] || currentRolePlan.city;
+  if (!confirm(`Создать роль ${currentRolePlan.name} в Webitel ${city}?`)) return;
+  btn.disabled = true;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Создаю...';
+  try {
+    const result = await api('/api/webitel/role_execute', {plan: currentRolePlan});
+    const created = `Роль ${esc(result.name)} создана${result.id ? ' (id ' + esc(result.id) + ')' : ''}`;
+    msgEl.className = result.objects_error ? 'msg error' : 'msg info';
+    msgEl.innerHTML = result.objects_error ? `${created}, но права в Objects НЕ выданы: ${esc(result.objects_error)}` : `Готово. ${created}.`;
+    // Done with this plan: confirming it again would only meet «уже есть».
+    currentRolePlan = null;
+    document.getElementById('roleConfirmRow').hidden = true;
+  } catch (e) {
+    msgEl.textContent = 'Ошибка: ' + e.message;
+    msgEl.className = 'msg error';
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 document.querySelectorAll('.tab-btn').forEach(tabBtn => {
   tabBtn.addEventListener('click', () => {
     // Only this card's tabs: «Создать» and «Группы» each have their own.
@@ -2125,52 +2229,76 @@ document.getElementById('btnCreateExecuteSingle').addEventListener('click', asyn
   }
 });
 
-document.getElementById('btnNeighbors').addEventListener('click', async () => {
-  // Searches around the new user's own login — no second number to type.
-  const extension = document.getElementById('singleNewLogin').value.trim();
-  const msgEl = document.getElementById('neighborsMsg');
-  const listEl = document.getElementById('neighborsList');
-  listEl.innerHTML = '';
-  if (!extension) {
-    msgEl.className = 'msg error';
-    msgEl.textContent = 'Сначала укажите логин нового пользователя (шаг 1) — соседей ищу вокруг него';
-    return;
-  }
-  const radius = parseInt(document.getElementById('neighborsRadius').value, 10) || 2;
-  msgEl.className = 'msg info';
-  msgEl.textContent = 'Ищу соседние номера (только чтение)...';
-  try {
-    const data = await api('/api/webitel/neighbors', {extension, radius, city: selectedCity});
-    if (data.neighbors.length === 0) {
-      msgEl.textContent = 'Соседних номеров не найдено — выберите образец вручную ниже.';
+// «Подобрать по соседним номерам»: template suggestions among the numbers
+// around the one being set up; «Взять» fills the template in. Only a help —
+// the template can always be typed instead.
+function setupNeighbors({button, radiusInput, msg, list, templateInput, center, skip, noCenterText}) {
+  document.getElementById(button).addEventListener('click', async () => {
+    const extension = center();
+    const msgEl = document.getElementById(msg);
+    const listEl = document.getElementById(list);
+    const templateEl = document.getElementById(templateInput);
+    listEl.innerHTML = '';
+    if (!extension) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = noCenterText;
       return;
     }
-    msgEl.textContent = `Соседи ${extension} — выберите образец (переговорки и «Vacant» лучше пропустить):`;
-    listEl.innerHTML = data.neighbors.map(n =>
-      `<div class="field neighbor" data-ext="${esc(n.extension)}"><span class="k">${esc(n.extension)} — ${esc(n.name)}` +
-      `<span class="neighbor-meta">${esc(n.group || '')}${n.roles && n.roles.length ? ' · ' + esc(n.roles.join(', ')) : ''}</span></span>` +
-      `<button type="button" class="pick-neighbor ghost" data-ext="${esc(n.extension)}">Взять</button></div>`
-    ).join('');
-    const markPicked = () => {
-      const picked = document.getElementById('singleTemplateExt').value.trim();
-      listEl.querySelectorAll('.neighbor').forEach(row => {
-        const isPicked = row.dataset.ext === picked;
-        row.classList.toggle('picked', isPicked);
-        row.querySelector('.pick-neighbor').textContent = isPicked ? '✓ Образец' : 'Взять';
+    const radius = parseInt(document.getElementById(radiusInput).value, 10) || 2;
+    msgEl.className = 'msg info';
+    msgEl.textContent = 'Ищу соседние номера (только чтение)...';
+    try {
+      const data = await api('/api/webitel/neighbors', {extension, radius, city: selectedCity});
+      const skipped = skip();
+      const neighbors = data.neighbors.filter(n => !skipped.includes(n.extension));
+      if (neighbors.length === 0) {
+        msgEl.textContent = 'Соседних номеров не найдено — укажите образец вручную.';
+        return;
+      }
+      msgEl.textContent = `Соседи ${extension} — выберите образец (переговорки и «Vacant» лучше пропустить):`;
+      listEl.innerHTML = neighbors.map(n =>
+        `<div class="field neighbor" data-ext="${esc(n.extension)}"><span class="k">${esc(n.extension)} — ${esc(n.name)}` +
+        `<span class="neighbor-meta">${esc(n.group || '')}${n.roles && n.roles.length ? ' · ' + esc(n.roles.join(', ')) : ''}</span></span>` +
+        `<button type="button" class="pick-neighbor ghost" data-ext="${esc(n.extension)}">Взять</button></div>`
+      ).join('');
+      const markPicked = () => {
+        const picked = templateEl.value.trim();
+        listEl.querySelectorAll('.neighbor').forEach(row => {
+          const isPicked = row.dataset.ext === picked;
+          row.classList.toggle('picked', isPicked);
+          row.querySelector('.pick-neighbor').textContent = isPicked ? '✓ Образец' : 'Взять';
+        });
+      };
+      listEl.querySelectorAll('.pick-neighbor').forEach(btn => {
+        btn.addEventListener('click', () => {
+          templateEl.value = btn.dataset.ext;
+          templateEl.dispatchEvent(new Event('input'));
+          markPicked();
+        });
       });
-    };
-    listEl.querySelectorAll('.pick-neighbor').forEach(btn => {
-      btn.addEventListener('click', () => {
-        document.getElementById('singleTemplateExt').value = btn.dataset.ext;
-        document.getElementById('singleTemplateExt').dispatchEvent(new Event('input'));
-        markPicked();
-      });
-    });
-    markPicked();
-  } catch (e) {
-    msgEl.className = 'msg error';
-    msgEl.textContent = 'Ошибка: ' + e.message;
-  }
+      markPicked();
+    } catch (e) {
+      msgEl.className = 'msg error';
+      msgEl.textContent = 'Ошибка: ' + e.message;
+    }
+  });
+}
+
+setupNeighbors({
+  button: 'btnNeighbors', radiusInput: 'neighborsRadius', msg: 'neighborsMsg', list: 'neighborsList',
+  templateInput: 'singleTemplateExt',
+  // Around the new user's own login — no second number to type.
+  center: () => document.getElementById('singleNewLogin').value.trim(),
+  skip: () => [],
+  noCenterText: 'Сначала укажите логин нового пользователя (шаг 1) — соседей ищу вокруг него',
+});
+setupNeighbors({
+  button: 'btnCopyNeighbors', radiusInput: 'copyNeighborsRadius', msg: 'copyNeighborsMsg', list: 'copyNeighborsList',
+  templateInput: 'templateExt',
+  // Around the first number to copy to; the others being set up aren't offered.
+  center: () => splitNumbers(document.getElementById('targetExt').value)[0] || '',
+  skip: () => splitNumbers(document.getElementById('targetExt').value),
+  noCenterText: 'Сначала укажите, кому скопировать — соседей ищу вокруг первого номера',
 });
 
 let currentCreatePlans = [];  // [{ok: true, plan} | {ok: false, login, error}]
@@ -2435,6 +2563,11 @@ dropPlanOnChange(['groupNumber', 'groupName', 'groupMembers', 'groupFallback'], 
   groupPlans.Single = [];
   showStalePlan('groupPlanMsgSingle', 'groupPlanListSingle', 'groupConfirmRowSingle');
 });
+dropPlanOnChange(['roleName'], () => {
+  if (!currentRolePlan) return;
+  currentRolePlan = null;
+  showStalePlan('rolePlanMsg', 'rolePlanCard', 'roleConfirmRow');
+});
 dropPlanOnChange(['passwordExt'], () => {
   if (currentPasswordPlans.length === 0) return;
   currentPasswordPlans = [];
@@ -2576,7 +2709,7 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             _audit(op, self._client_ip(), self.path, {**details, "ok": False, "error": str(exc)[:300]})
             raise
-        for key in ("permissions_error", "route_error", "devices_error"):
+        for key in ("permissions_error", "route_error", "devices_error", "objects_error"):
             if isinstance(result, dict) and result.get(key):
                 # The main change went through; only a follow-up step failed.
                 details[key] = str(result[key])[:300]
@@ -2896,6 +3029,28 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
                 result = self._run_audited(op, plan, lambda: actions.execute_password_plan(plan))
+                self._send_json(200, result)
+                return
+
+            if self.path == "/api/webitel/role_plan":
+                name = str(body.get("name") or "").strip()
+                city = str(body.get("city") or "almaty").strip() or "almaty"
+                if not name:
+                    self._send_json(400, {"error": "Укажите название роли"})
+                    return
+                actions = _get_webitel_actions(op, city)
+                plan = actions.build_role_plan(name)
+                plan["city"] = city
+                self._send_json(200, plan)
+                return
+
+            if self.path == "/api/webitel/role_execute":
+                plan = body.get("plan")
+                if not plan:
+                    self._send_json(400, {"error": "plan is required"})
+                    return
+                actions = _get_webitel_actions(op, plan.get("city", "almaty") or "almaty")
+                result = self._run_audited(op, plan, lambda: actions.execute_role_plan(plan))
                 self._send_json(200, result)
                 return
 

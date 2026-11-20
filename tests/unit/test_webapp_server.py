@@ -216,6 +216,21 @@ class TestConsoleServer(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("шаблона", payload["error"])
 
+    def test_role_endpoints_need_a_name_and_a_plan(self) -> None:
+        status, payload = self._post("/api/webitel/role_plan", {"name": " "})
+        self.assertEqual(status, 400)
+        self.assertIn("название", payload["error"])
+        self.assertEqual(self._post("/api/webitel/role_execute", {})[0], 400)
+
+    def test_role_plan_carries_the_city(self) -> None:
+        class _Actions:
+            def build_role_plan(self, name: str) -> dict:
+                return {"name": name, "objects": []}
+
+        with mock.patch.object(server, "_get_webitel_actions", return_value=_Actions()):
+            status, plan = self._post("/api/webitel/role_plan", {"name": " user-TEST-ROLE ", "city": "astana"})
+        self.assertEqual((status, plan["name"], plan["city"]), (200, "user-TEST-ROLE", "astana"))
+
     def test_password_endpoints_need_an_extension_and_a_plan(self) -> None:
         self.assertEqual(self._post("/api/webitel/password_plan", {"extension": " "})[0], 400)
         self.assertEqual(self._post("/api/webitel/password_execute", {})[0], 400)

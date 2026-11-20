@@ -15,10 +15,11 @@ Never fabricated.
 
 Safety posture, matching everything built so far:
 - ``build_plan``/``build_create_plan``/``build_delete_plan``/
-  ``build_group_plan`` are pure read (GETs only) and never touch any data.
-  ``execute_plan``, ``execute_create_plan``, ``execute_delete_plan`` and
-  ``execute_group_plan`` (a group number's Flow schema and Dialplan route,
-  2026-11-02) are the
+  ``build_group_plan``/``build_password_plan``/``build_role_plan`` are pure
+  read (GETs only) and never touch any data. ``execute_plan``,
+  ``execute_create_plan``, ``execute_delete_plan``, ``execute_group_plan``
+  (a group number's Flow schema and Dialplan route, 2026-11-02),
+  ``execute_password_plan`` and ``execute_role_plan`` (2026-11-20) are the
   only functions in this project that perform a write/delete, and each is
   reachable only through the console's explicit two-step "show plan, then
   confirm" flow — never auto-triggered by a plan or ticket read.
@@ -164,6 +165,17 @@ def _check_group_numbers(number: str, extensions: list[str], fallback: str) -> N
         raise WebitelApiError(f"номер «если никто не ответил» «{fallback}» — только цифры")
     if fallback == number:
         raise WebitelApiError("если никто не ответил, звонок не может уйти обратно на групповой номер")
+
+
+# What every new role gets (the operator's own, captured 2026-11-20 from
+# Webitel's Roles form and Permissions → Objects): call records may be played
+# back, two applications are on, and the role gets these letters on these
+# objects — x Create, r Read, w Edit, d Delete, as the Objects page sets them.
+ROLE_PERMISSIONS = [
+    {"id": "playback_record_file", "name": "Playback record file", "usage": "Grants permission to playback call-record files"},
+]
+ROLE_APPLICATIONS = {"agent": "Agent Workspace", "history": "Call History"}  # metadata.access key → name in Webitel
+ROLE_OBJECT_GRANTS = {"users": "r", "calls": "xr"}
 
 
 # The fields Webitel's Devices form sends on «Save», with what it sends for
@@ -340,10 +352,15 @@ class WebitelApiActions:
         {"id", "name", "user": true for a person, absent for a role},
         "granted": "r" | "rw" | "xrwdxrwd" ...}]}``."""
 
+        return self._acl(f"/api/users/{user_id}/acl")
+
+    def _acl(self, path: str) -> list[dict[str, Any]]:
+        """Every grant of an ACL (a user's Permissions tab, an object's on
+        Permissions → Objects), page by page while ``next`` says more follow."""
         items: list[dict[str, Any]] = []
         page = 1
         while True:
-            data = self._get(f"/api/users/{user_id}/acl?page={page}&size=100")
+            data = self._get(f"{path}?page={page}&size=100")
             items.extend(data.get("items") or [])
             if not data.get("next"):
                 return items
@@ -475,13 +492,26 @@ class WebitelApiActions:
 
     def _grant_permissions(self, user_id: str, grants: list[dict[str, Any]], result: dict[str, Any]) -> dict[str, Any]:
         """Makes each planned grantee's permissions on ``user_id`` exactly the
-        planned ones, via ``PATCH /api/users/{id}/acl`` (shape confirmed
-        2026-10-16 from Webitel's own Permissions tab:
-        ``[{"grantee": <id>, "grants": "r"}]``).
+        planned ones — see _apply_grants. This runs after the user was
+        already written, so a failure comes back as ``permissions_error`` in
+        the result instead of an exception — raising would lose a password
+        that write already set."""
+        if not grants:
+            return result
+        error, applied = self._apply_grants(f"/api/users/{user_id}/acl", grants)
+        if applied is not None:
+            result = {**result, "permissions_copied": applied}
+        return {**result, "permissions_error": error} if error else result
+
+    def _apply_grants(self, path: str, grants: list[dict[str, Any]]) -> tuple[str, int | None]:
+        """Makes each grantee's letters on the ACL at ``path`` exactly the
+        given ones, via ``PATCH <path>`` with ``[{"grantee": <id>, "grants":
+        "r"}]`` (shape confirmed 2026-10-16 from a user's Permissions tab,
+        and 2026-11-20 the same on Permissions → Objects).
 
         That PATCH does not SET permissions, it FLIPS the letters it names
         (confirmed 2026-10-18 on test user 30120): "r" + "w" -> "rw", "rw" +
-        "w" -> "r", "rw" + "rw" -> the grantee disappears. So the target's
+        "w" -> "r", "rw" + "rw" -> the grantee disappears. So the current
         permissions are read first: a grantee that already has the planned
         ones is left alone, one it lacks gets them, and one with other
         permissions is first cleared (by sending what it has) and then given
@@ -490,16 +520,12 @@ class WebitelApiActions:
         again would take them away — the first version did exactly that.
         Afterwards the permissions are read back and compared with the plan.
 
-        This runs after the user was already written, so a failure comes
-        back as ``permissions_error`` in the result instead of an exception —
-        raising would lose a password that write already set."""
-        if not grants:
-            return result
-        path = f"/api/users/{user_id}/acl"
+        Returns the error ("" when every grant is in place) and how many
+        grants are in place (None when that couldn't be read)."""
         try:
-            current = {str(p["grantee"]["id"]): p.get("granted", "") for p in self.get_permissions(user_id)}
+            current = {str(p["grantee"]["id"]): p.get("granted", "") for p in self._acl(path)}
         except WebitelApiError as exc:
-            return {**result, "permissions_error": f"не удалось прочитать права перед записью: {exc}"}
+            return f"не удалось прочитать права перед записью: {exc}", None
         errors: list[str] = []
         for grant in grants:
             have = current.get(str(grant["grantee"]), "")
@@ -512,16 +538,15 @@ class WebitelApiActions:
             except WebitelApiError as exc:
                 errors.append(f"{grant['name'] or grant['grantee']}: {exc}")
         try:
-            actual = {str(p["grantee"]["id"]): p.get("granted", "") for p in self.get_permissions(user_id)}
+            actual = {str(p["grantee"]["id"]): p.get("granted", "") for p in self._acl(path)}
         except WebitelApiError as exc:
-            return {**result, "permissions_error": f"не удалось проверить права после записи: {exc}"}
+            return f"не удалось проверить права после записи: {exc}", None
         missing = [g for g in grants if actual.get(str(g["grantee"])) != g["grants"]]
         if missing:
             names = ", ".join(f"{g['name'] or g['grantee']} ({g['grants']})" for g in missing)
             detail = f" — {'; '.join(errors)}" if errors else ""
-            return {**result, "permissions_error": f"не встали: {names}{detail}",
-                    "permissions_copied": len(grants) - len(missing)}
-        return {**result, "permissions_copied": len(grants)}
+            return f"не встали: {names}{detail}", len(grants) - len(missing)
+        return "", len(grants)
 
     def build_create_plan(
         self,
@@ -885,3 +910,71 @@ class WebitelApiActions:
             "name": user.get("name", ""),
             "new_password": password,
         })
+
+    def find_role(self, name: str) -> dict[str, Any] | None:
+        """Read-only: the role named exactly ``name``, or None. Compared
+        here, since the search (``q``) also matches parts of names. List
+        shape assumed to be Webitel's usual ``{"items": [...]}`` — not yet
+        seen from the real Roles page."""
+        query = urllib.parse.quote(name)
+        data = self._get(f"/api/roles?page=1&size=100&q={query}")
+        items = data if isinstance(data, list) else data.get("items") or []
+        return next((item for item in items if item.get("name") == name), None)
+
+    def _role_objects(self) -> list[dict[str, str]]:
+        """Read-only: ROLE_OBJECT_GRANTS with each object's id in this
+        Webitel, looked up by name on Permissions → Objects (users 2 and
+        calls 4 in Almaty — Astana's may differ). The list's shape is
+        assumed, not yet seen: an item's name is taken from ``class`` or
+        ``name``."""
+        data = self._get("/api/objclass?page=1&size=100")
+        items = data if isinstance(data, list) else data.get("items") or []
+        ids = {str(item.get("class") or item.get("name")): str(item["id"]) for item in items if item.get("id")}
+        missing = [name for name in ROLE_OBJECT_GRANTS if name not in ids]
+        if missing:
+            raise WebitelApiError(f"в Permissions → Objects не найдены: {', '.join(missing)}")
+        return [{"object": name, "id": ids[name], "grants": grants} for name, grants in ROLE_OBJECT_GRANTS.items()]
+
+    def build_role_plan(self, name: str) -> dict[str, Any]:
+        """Read-only: refuses a name some role already has, and finds the
+        objects the new role gets rights on. The plan lists everything the
+        role will get, for the approver to see."""
+        if self.find_role(name) is not None:
+            raise WebitelApiError(f"роль «{name}» уже есть в Webitel — дубликат не создаю")
+        return {
+            "name": name,
+            "permissions": [p["name"] for p in ROLE_PERMISSIONS],
+            "applications": list(ROLE_APPLICATIONS.values()),
+            "objects": self._role_objects(),
+        }
+
+    def execute_role_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
+        """``POST /api/roles`` with the body Webitel's own Roles form sends
+        (confirmed 2026-11-20: role permissions and applications go in the
+        same request), then the role's rights on each object — see
+        _apply_grants. Re-checks the name first, and takes the role's
+        contents from ROLE_* and the objects' ids fresh, not from the plan.
+
+        A failure on the objects comes back as ``objects_error`` instead of
+        an exception: the role already exists by then."""
+        name = plan["name"]
+        if self.find_role(name) is not None:
+            raise WebitelApiError(f"роль «{name}» уже есть в Webitel — дубликат не создаю")
+        objects = self._role_objects()
+        role = self._post("/api/roles", {
+            "name": name,
+            "description": "",
+            "permissions": ROLE_PERMISSIONS,
+            "metadata": {"access": {key: {"_enabled": True} for key in ROLE_APPLICATIONS}},
+        })
+        if not role.get("id"):
+            return {"name": name, "objects_error": "Webitel не вернул id новой роли — права в Objects не выданы"}
+        errors: list[str] = []
+        for obj in objects:
+            error, _ = self._apply_grants(
+                f"/api/objclass/{obj['id']}/acl", [{"grantee": int(role["id"]), "grants": obj["grants"], "name": name}],
+            )
+            if error:
+                errors.append(f"{obj['object']}: {error}")
+        result = {"id": role["id"], "name": name}
+        return {**result, "objects_error": "; ".join(errors)} if errors else result
