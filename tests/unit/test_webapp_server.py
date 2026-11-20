@@ -444,6 +444,18 @@ class TestSharedConsole(unittest.TestCase):
         path = self.root / "audit.jsonl"
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
+    def test_an_address_outside_the_allowed_nets_gets_nothing(self) -> None:
+        with mock.patch.object(server, "_ip_allowed", return_value=False):
+            with self.assertRaises(urllib.error.HTTPError) as page:
+                self._open_page()
+            status, payload = self._post("/api/crm/credentials", {})
+        self.assertEqual(page.exception.code, 403)
+        self.assertIn("Нет доступа к консоли", page.exception.read().decode("utf-8"))
+        self.assertEqual(page.exception.headers.get("Set-Cookie"), None)
+        self.assertFalse((self.root / "operators").exists())  # no workspace started
+        self.assertEqual(status, 403)
+        self.assertIn("Нет доступа", payload["error"])
+
     def test_opening_the_page_gives_the_browser_its_own_workspace(self) -> None:
         html, set_cookie = self._open_page()
         self.assertIn("Консоль на сервере", html)
@@ -569,6 +581,25 @@ class TestSharedConsoleConfig(unittest.TestCase):
         self.assertNotEqual(server._exposure_problem("0.0.0.0", True, False), "")
         self.assertEqual(server._exposure_problem("0.0.0.0", True, True), "")
         self.assertEqual(server._exposure_problem("127.0.0.1", False, False), "")
+
+    def test_allowed_nets_take_addresses_and_networks(self) -> None:
+        nets = server._parse_allowed_nets(" 10.80.0.0/24, 10.70.70.5\n10.90.5.152/29 ")
+        self.assertEqual([str(n) for n in nets], ["10.80.0.0/24", "10.70.70.5/32", "10.90.5.152/29"])
+        self.assertEqual(server._parse_allowed_nets(""), [])
+
+    def test_a_typo_in_allowed_nets_is_refused_not_ignored(self) -> None:
+        for raw in ("10.80.0.0/33", "10.80.0", "vpn"):
+            with self.assertRaises(ValueError, msg=raw):
+                server._parse_allowed_nets(raw)
+
+    def test_who_is_let_in(self) -> None:
+        nets = server._parse_allowed_nets("10.80.0.0/24, 10.70.70.0/24")
+        self.assertTrue(server._ip_allowed("10.80.0.118", nets))
+        self.assertTrue(server._ip_allowed("10.70.70.2", nets))
+        self.assertFalse(server._ip_allowed("10.80.29.229", nets))
+        self.assertTrue(server._ip_allowed("127.0.0.1", nets))  # the server itself
+        self.assertFalse(server._ip_allowed("not-an-ip", nets))
+        self.assertTrue(server._ip_allowed("10.80.29.229", []))  # no list = as before
 
 
 class TestResolveCrmLogin(unittest.TestCase):
