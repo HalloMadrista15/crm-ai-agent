@@ -475,6 +475,7 @@ class TestSharedConsole(unittest.TestCase):
             mock.patch.dict(server._crm_sessions, clear=True),
             mock.patch.dict(server._webitel_login_jobs, clear=True),
             mock.patch.dict(server._workspace_seen, clear=True),
+            mock.patch.dict(server._journal_access, clear=True),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -599,9 +600,9 @@ class TestSharedConsole(unittest.TestCase):
                  for e in entries]
         (self.root / "audit.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def _journal(self, query: str = "", offset: int = 0, session: str = "active", cookie: str = ""):
+    def _journal(self, query: str = "", offset: int = 0, session: str = "active", limit: object = 100):
         with mock.patch.object(server, "_webitel_session_state", return_value={"session": session}):
-            return self._post("/api/journal", {"query": query, "offset": offset}, cookie=cookie or self._new_browser())
+            return self._post("/api/journal", {"query": query, "offset": offset, "limit": limit}, cookie=self._new_browser())
 
     def test_the_journal_tells_who_did_what_newest_first(self) -> None:
         self._write_log(
@@ -643,6 +644,27 @@ class TestSharedConsole(unittest.TestCase):
         self.assertEqual(len(self._journal(offset=-5)[1]["entries"]), 100)
         (self.root / "audit.jsonl").unlink()
         self.assertEqual(self._journal()[1], {"entries": [], "total": 0})
+
+    def test_the_journal_shows_as_many_as_asked_for(self) -> None:
+        self._write_log(*[{"action": "/api/webitel/password_execute", "extension": str(10000 + n)} for n in range(150)])
+        for limit, shown in ((10, 10), (25, 25), (50, 50), (100, 100), (None, 25), (100000, 25), (-1, 25), ("50", 25)):
+            data = self._journal(limit=limit)[1]
+            self.assertEqual((data["total"], len(data["entries"])), (150, shown), limit)
+        self.assertEqual([e["number"] for e in self._journal(offset=10, limit=10)[1]["entries"]], [str(10139 - n) for n in range(10)])
+
+    def test_webitel_is_not_asked_again_on_every_search(self) -> None:
+        self._write_log({"action": "/api/webitel/create_execute", "new_extension": "30121"})
+        cookie, other = self._new_browser(), self._new_browser()
+        with mock.patch.object(server, "_webitel_session_state", return_value={"session": "active"}) as asked:
+            for _ in range(5):
+                self.assertEqual(self._post("/api/journal", {}, cookie=cookie)[0], 200)
+            self.assertEqual(asked.call_count, 1)
+        with mock.patch.object(server, "_webitel_session_state", return_value={"session": "expired"}):
+            self.assertEqual(self._post("/api/journal", {}, cookie=cookie)[0], 200)
+            self.assertEqual(self._post("/api/journal", {}, cookie=other)[0], 403)  # only the browser that was checked
+            for workspace in server._journal_access:
+                server._journal_access[workspace] -= server._JOURNAL_ACCESS_SECONDS + 1
+            self.assertEqual(self._post("/api/journal", {}, cookie=cookie)[0], 403)
 
     def test_the_journal_needs_a_webitel_login(self) -> None:
         self._write_log({"action": "/api/webitel/create_execute", "new_extension": "30121", "new_name": "Иван Иванов"})

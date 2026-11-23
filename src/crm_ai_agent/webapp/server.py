@@ -531,7 +531,11 @@ _JOURNAL_KINDS = {
     "role_execute": "Роль",
 }
 _JOURNAL_PROBLEMS = {"permissions_error": "права", "route_error": "маршрут", "devices_error": "устройство", "objects_error": "Objects"}
-_JOURNAL_PAGE = 100
+_JOURNAL_LIMITS = (10, 25, 50, 100)
+# How long a browser found to be logged in to Webitel may go on reading the
+# journal before Webitel is asked again.
+_JOURNAL_ACCESS_SECONDS = 300
+_journal_access: dict[str, float] = {}
 
 
 def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -571,7 +575,7 @@ def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _read_journal(query: str, offset: int) -> dict[str, Any]:
+def _read_journal(query: str, offset: int, limit: int) -> dict[str, Any]:
     """The audit log, newest first; every word of ``query`` has to be
     somewhere in what an entry shows."""
     with _audit_lock:
@@ -586,15 +590,18 @@ def _read_journal(query: str, offset: int) -> dict[str, Any]:
         text = " ".join(shown[key] for key in ("kind", "city", "number", "name", "details", "who")).lower()
         if all(word in text for word in words):
             found.append(shown)
-    return {"entries": found[offset:offset + _JOURNAL_PAGE], "total": len(found)}
+    return {"entries": found[offset:offset + limit], "total": len(found)}
 
 
 def _may_read_journal(op: _Operator) -> bool:
     """Colleagues' names and numbers: on a shared console only for a browser
     that is logged in to Webitel through it."""
-    return not _SHARED or any(
-        _webitel_session_state(op, city)["session"] == "active" for city in WEBITEL_STORAGE_STATE_PATHS
-    )
+    if not _SHARED or time.time() - _journal_access.get(op.name, 0) < _JOURNAL_ACCESS_SECONDS:
+        return True
+    logged_in = any(_webitel_session_state(op, city)["session"] == "active" for city in WEBITEL_STORAGE_STATE_PATHS)
+    if logged_in:
+        _journal_access[op.name] = time.time()
+    return logged_in
 
 
 _INDEX_HTML = """<!doctype html>
@@ -732,6 +739,7 @@ _INDEX_HTML = """<!doctype html>
   button:disabled{background:var(--surface-3);color:var(--text-faint);cursor:not-allowed;transform:none;}
   button.danger{background:var(--danger);color:#fff;box-shadow:0 8px 24px -10px rgba(240,90,75,.7);}
   button.danger:hover{background:var(--danger-dark);}
+  button.danger:disabled{background:var(--surface-3);color:var(--text-faint);box-shadow:none;}
   button.ghost{background:var(--surface-2);color:var(--text);border:1px solid var(--border);padding:6px 13px;font-size:12.5px;font-weight:500;}
   button.ghost:hover{background:var(--surface-3);border-color:var(--border-strong);}
   button.ghost:disabled{opacity:.45;cursor:not-allowed;background:transparent;border-color:var(--border);}
@@ -826,6 +834,12 @@ _INDEX_HTML = """<!doctype html>
   .journal-note{display:block;font-size:12px;color:var(--text-soft);}
   .journal-who{color:var(--text-soft);text-align:right;overflow-wrap:anywhere;}
   .journal-more{margin-top:14px;}
+  .journal-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;}
+  .journal-bar .msg{margin:0;}
+  .journal-limits{width:auto;margin:0 0 0 auto;}
+  .limit-btn{background:transparent;color:var(--text-soft);font-weight:500;font-size:13px;padding:5px 12px;border-radius:999px;}
+  .limit-btn:hover{background:var(--surface-2);color:var(--text);}
+  .limit-btn.active,.limit-btn.active:hover{background:var(--surface-3);color:var(--text);box-shadow:inset 0 0 0 1px var(--border-strong);}
 
   /* Low windows: everything in the rail has to fit. */
   @media (max-height:800px) and (min-width:761px){
@@ -1244,7 +1258,7 @@ _INDEX_HTML = """<!doctype html>
       <div class="split-main">
         <div class="row">
           <div class="field-group">
-            <label class="field-label" for="deleteExt">Логин/добавочный (можно несколько через запятую)</label>
+            <label class="field-label" for="deleteExt">Логин/добавочный (через запятую, можно диапазон 15210-15220)</label>
             <input type="text" id="deleteExt" placeholder="напр. 10087, 10097">
           </div>
         </div>
@@ -1255,6 +1269,12 @@ _INDEX_HTML = """<!doctype html>
       <div class="split-side">
         <div id="deletePlanMsg" class="msg info"></div>
         <div id="deletePlanList" class="list"></div>
+        <div class="row" id="deleteCountRow" hidden>
+          <div class="field-group">
+            <label class="field-label" for="deleteCount" id="deleteCountLabel"></label>
+            <input type="text" id="deleteCount" inputmode="numeric" autocomplete="off">
+          </div>
+        </div>
         <div class="row" id="deleteConfirmRow" hidden>
           <button id="btnDeleteExecute" class="danger">Подтвердить и удалить все</button>
         </div>
@@ -1428,7 +1448,15 @@ _INDEX_HTML = """<!doctype html>
         </div>
         <button id="btnJournal">Найти</button>
       </div>
-      <div id="journalMsg" class="msg info"></div>
+      <div class="journal-bar">
+        <div id="journalMsg" class="msg info"></div>
+        <div class="tabs journal-limits" role="group" aria-label="Сколько записей показывать">
+          <button type="button" class="limit-btn" data-limit="10">10</button>
+          <button type="button" class="limit-btn active" data-limit="25">25</button>
+          <button type="button" class="limit-btn" data-limit="50">50</button>
+          <button type="button" class="limit-btn" data-limit="100">100</button>
+        </div>
+      </div>
       <div id="journalList" class="list"></div>
       <div class="row journal-more" id="journalMoreRow" hidden>
         <button type="button" id="btnJournalMore" class="ghost">Показать ещё</button>
@@ -1506,7 +1534,7 @@ const CITY_PLACEHOLDERS = {
     templateExt: 'напр. 10078', targetExt: 'напр. 10079, 10085-10090',
     singleNewLogin: 'напр. 10087', singleTemplateExt: 'напр. 10078',
     createTemplateExt: 'напр. 10078', createBulkList: '10087,Иван Иванов\\n10097,Мария Петрова',
-    deleteExt: 'напр. 10087, 10097', passwordExt: 'напр. 10087, 10097',
+    deleteExt: 'напр. 10087, 10090-10095', passwordExt: 'напр. 10087, 10097',
     groupNumber: 'напр. 30151', groupName: 'напр. ALM-OP-30151', groupMembers: 'напр. 30152, 30153',
     groupBulkList: '30151, ALM-OP-30151: 30152, 30153\\n30161, ALM-OP-30161: 30162, 30163',
   },
@@ -1514,7 +1542,7 @@ const CITY_PLACEHOLDERS = {
     templateExt: 'напр. 28070', targetExt: 'напр. 28071, 28075-28080',
     singleNewLogin: 'напр. 28071', singleTemplateExt: 'напр. 28070',
     createTemplateExt: 'напр. 28070', createBulkList: '28071,Иван Иванов\\n28075,Мария Петрова',
-    deleteExt: 'напр. 28071, 28075', passwordExt: 'напр. 28071, 28075',
+    deleteExt: 'напр. 28071, 28075-28080', passwordExt: 'напр. 28071, 28075',
     groupNumber: 'напр. 21701', groupName: 'напр. BMW Astana - 21701', groupMembers: 'напр. 21703, 21704',
     groupBulkList: '21701, BMW Astana - 21701: 21703, 21704 > 21700\\n28020, AST-AMP - 28020: 21322, 21323',
   },
@@ -2213,10 +2241,11 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
   msgEl.textContent = `Строю план для ${targets.length} — только чтение...`;
 
   const missing = [];
+  const city = selectedCity;  // for the whole plan, even if it is switched meanwhile
   for (const target_extension of targets) {
     try {
       const plan = await api('/api/webitel/plan', {
-        template_extension, target_extension, city: selectedCity,
+        template_extension, target_extension, city,
         reset_password: document.getElementById('resetPasswordCheck').checked,
         copy_permissions: document.getElementById('copyPermissionsCheck').checked,
       });
@@ -2297,43 +2326,51 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
 });
 
 let currentDeletePlans = [];  // [{ok: true, plan} | {ok: false, extension, error}]
+let deletePlanRequest = 0;
+const DELETE_WITHOUT_COUNT = 5;
 
 document.getElementById('btnDeletePlan').addEventListener('click', async () => {
-  const extensions = document.getElementById('deleteExt').value
-    .split(',')
-    .map(x => x.trim())
-    .filter(x => x.length > 0);
+  const {numbers: extensions, error} = expandNumbers(document.getElementById('deleteExt').value);
   const msgEl = document.getElementById('deletePlanMsg');
   const listEl = document.getElementById('deletePlanList');
-  const confirmRow = document.getElementById('deleteConfirmRow');
+  const request = ++deletePlanRequest;
+  const city = selectedCity;
   listEl.innerHTML = '';
-  confirmRow.hidden = true;
   currentDeletePlans = [];
+  askToDelete('', 0);
 
-  if (extensions.length === 0) {
+  if (error || extensions.length === 0) {
     msgEl.className = 'msg error';
-    msgEl.textContent = 'Укажите хотя бы один логин/добавочный';
+    msgEl.textContent = error || 'Укажите хотя бы один логин/добавочный';
     return;
   }
 
+  const plans = [];
+  const missing = [];
   msgEl.className = 'msg info';
-  msgEl.textContent = `Ищу ${extensions.length} — только чтение...`;
-
-  for (const extension of extensions) {
+  for (const [done, extension] of extensions.entries()) {
+    msgEl.textContent = `Ищу ${done + 1} из ${extensions.length} — только чтение...`;
     try {
-      const plan = await api('/api/webitel/delete_plan', {extension, city: selectedCity});
-      currentDeletePlans.push({ok: true, plan});
+      const plan = await api('/api/webitel/delete_plan', {extension, city});
+      plans.push({ok: true, plan});
     } catch (e) {
-      currentDeletePlans.push({ok: false, extension, error: e.message});
+      if (e.data && e.data.missing === extension) missing.push(extension);
+      else plans.push({ok: false, extension, error: e.message});
     }
+    if (request !== deletePlanRequest) return;  // the numbers were changed meanwhile
   }
+  currentDeletePlans = plans;
 
   const deletable = currentDeletePlans.filter(r => r.ok && !r.plan.in_call);
   const inCall = currentDeletePlans.filter(r => r.ok && r.plan.in_call);
   const notFound = currentDeletePlans.filter(r => !r.ok);
   msgEl.textContent = `Будет удалено: ${deletable.length}` +
     (inCall.length ? ` · пропущено (идёт разговор): ${inCall.length}` : '') +
-    (notFound.length ? ` · не найдено / ошибка: ${notFound.length}` : '');
+    (missing.length ? ` · нет в Webitel: ${missing.length}` : '') +
+    (notFound.length ? ` · ошибка: ${notFound.length}` : '');
+  const missingRow = missing.length
+    ? `<div class="field list-error"><span class="k">нет в Webitel</span><span class="v">${missing.map(esc).join(', ')}</span></div>`
+    : '';
   listEl.innerHTML = currentDeletePlans.map(r => {
     if (!r.ok) {
       return `<div class="field list-error"><span class="k">${esc(r.extension)}</span><span class="v">${esc(r.error)}</span></div>`;
@@ -2352,10 +2389,27 @@ document.getElementById('btnDeletePlan').addEventListener('click', async () => {
       : `<span class="presence idle">Статус: не в сети (Web, SIP, Dlg, DnD неактивны)</span>`;
     return `<div class="field ${presence.length ? 'list-warn' : 'list-ok'}">${who}` +
       `<span class="v status">✓ группа: ${esc(r.plan.group || '—')}${deviceNote}${statusLine}</span></div>`;
-  }).join('');
+  }).join('') + missingRow;
 
-  document.getElementById('btnDeleteExecute').textContent = `Подтвердить и удалить (${deletable.length})`;
-  confirmRow.hidden = deletable.length === 0;
+  askToDelete('Подтвердить и удалить', deletable.length);
+});
+
+// The red button for ``count`` people. For more than a few of them their
+// number has to be typed first: a slip in a range can't delete dozens.
+function askToDelete(text, count) {
+  const typed = document.getElementById('deleteCount');
+  const btn = document.getElementById('btnDeleteExecute');
+  typed.value = '';
+  typed.dataset.expected = count;
+  document.getElementById('deleteCountLabel').textContent = `Будет удалено ${count}. Введите ${count}, чтобы подтвердить`;
+  document.getElementById('deleteCountRow').hidden = count <= DELETE_WITHOUT_COUNT;
+  btn.textContent = `${text} (${count})`;
+  btn.disabled = count > DELETE_WITHOUT_COUNT;
+  document.getElementById('deleteConfirmRow').hidden = count === 0;
+}
+
+document.getElementById('deleteCount').addEventListener('input', event => {
+  document.getElementById('btnDeleteExecute').disabled = event.target.value.trim() !== event.target.dataset.expected;
 });
 
 document.getElementById('btnDeleteExecute').addEventListener('click', async () => {
@@ -2366,7 +2420,8 @@ document.getElementById('btnDeleteExecute').addEventListener('click', async () =
   const label = r => `${r.plan.name} (${r.plan.extension})`;
   const online = toDelete.filter(r => (r.plan.presence || []).length > 0);
   const skipped = currentDeletePlans.filter(r => r.ok && r.plan.in_call);
-  const text = `УДАЛИТЬ НАВСЕГДА ${toDelete.length}:\\n${toDelete.map(label).join('\\n')}` +
+  const city = WEBITEL_CITY_NAMES[toDelete[0].plan.city] || toDelete[0].plan.city;
+  const text = `УДАЛИТЬ НАВСЕГДА ${toDelete.length} (${city}):\\n${toDelete.map(label).join('\\n')}` +
     (online.length ? `\\n\\nСейчас в сети — их сессии будут завершены:\\n${online.map(r => label(r) + ' — ' + r.plan.presence.join(', ')).join('\\n')}` : '') +
     (skipped.length ? `\\n\\nНЕ будут удалены (идёт разговор):\\n${skipped.map(label).join('\\n')}` : '');
   if (!confirm(text)) return;
@@ -2393,11 +2448,10 @@ document.getElementById('btnDeleteExecute').addEventListener('click', async () =
   // Only what didn't work out stays for another try: pressing the button
   // again used to ask Webitel to delete everyone a second time.
   currentDeletePlans = failed;
-  btn.textContent = `Повторить (${failed.length})`;
-  document.getElementById('deleteConfirmRow').hidden = failed.length === 0;
   msgEl.className = 'msg info';
   msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
   btn.disabled = false;
+  askToDelete('Повторить', failed.length);
 });
 
 let currentPasswordPlans = [];  // [{ok: true, plan} | {ok: false, extension, error}]
@@ -2421,9 +2475,10 @@ document.getElementById('btnPasswordPlan').addEventListener('click', async () =>
   msgEl.className = 'msg info';
   msgEl.textContent = `Ищу ${extensions.length} — только чтение...`;
 
+  const city = selectedCity;
   for (const extension of extensions) {
     try {
-      const plan = await api('/api/webitel/password_plan', {extension, city: selectedCity});
+      const plan = await api('/api/webitel/password_plan', {extension, city});
       currentPasswordPlans.push({ok: true, plan});
     } catch (e) {
       currentPasswordPlans.push({ok: false, extension, error: e.message});
@@ -2480,6 +2535,7 @@ document.getElementById('btnPasswordExecute').addEventListener('click', async ()
 
 // «Журнал»: the console's own log of what was changed, newest first.
 let journalShown = 0;
+let journalLimit = 25;
 let journalRequest = 0;
 
 function journalRow(e) {
@@ -2500,12 +2556,12 @@ async function loadJournal(offset) {
   msgEl.className = 'msg info';
   msgEl.textContent = 'Читаю журнал...';
   try {
-    const data = await api('/api/journal', {query: document.getElementById('journalQuery').value, offset});
+    const data = await api('/api/journal', {query: document.getElementById('journalQuery').value, offset, limit: journalLimit});
     if (request !== journalRequest) return;  // a newer search is already on its way
     if (offset === 0) listEl.innerHTML = '';
     listEl.insertAdjacentHTML('beforeend', data.entries.map(journalRow).join(''));
     journalShown = offset + data.entries.length;
-    msgEl.textContent = data.total ? `Записей: ${data.total}` : 'Ничего не найдено';
+    msgEl.textContent = data.total ? `Показано ${journalShown} из ${data.total}` : 'Ничего не найдено';
     moreRow.hidden = journalShown >= data.total;
   } catch (e) {
     if (request !== journalRequest) return;
@@ -2517,6 +2573,13 @@ async function loadJournal(offset) {
 }
 
 document.getElementById('btnJournal').addEventListener('click', () => loadJournal(0));
+document.querySelectorAll('.limit-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.limit-btn').forEach(b => b.classList.toggle('active', b === btn));
+    journalLimit = Number(btn.dataset.limit);
+    loadJournal(0);
+  });
+});
 document.getElementById('btnJournalMore').addEventListener('click', () => loadJournal(journalShown));
 document.getElementById('journalQuery').addEventListener('keydown', event => {
   if (event.key === 'Enter') loadJournal(0);
@@ -2771,10 +2834,11 @@ document.getElementById('btnCreatePlan').addEventListener('click', async () => {
   msgEl.className = 'msg info';
   msgEl.textContent = `Строю план для ${entries.length} — только чтение...`;
 
+  const city = selectedCity;
   for (const entry of entries) {
     try {
       const plan = await api('/api/webitel/create_plan', {
-        template_extension, new_username: entry.login, new_name: entry.name, new_extension: entry.login, city: selectedCity,
+        template_extension, new_username: entry.login, new_name: entry.name, new_extension: entry.login, city,
         copy_permissions: document.getElementById('bulkCopyPermissionsCheck').checked,
       });
       currentCreatePlans.push({ok: true, plan});
@@ -2890,6 +2954,7 @@ async function buildGroupPlans(tab) {
   msgEl.className = 'msg info';
   msgEl.textContent = `Строю план для ${entries.length} — только чтение...`;
 
+  const city = selectedCity;
   for (const entry of entries) {
     if (entry.error) {
       groupPlans[tab].push({ok: false, name: entry.name, error: entry.error});
@@ -2897,7 +2962,7 @@ async function buildGroupPlans(tab) {
     }
     try {
       const plan = await api('/api/webitel/group_plan', {
-        number: entry.number, name: entry.name, extensions: entry.extensions, fallback: entry.fallback, city: selectedCity,
+        number: entry.number, name: entry.name, extensions: entry.extensions, fallback: entry.fallback, city,
       });
       groupPlans[tab].push({ok: true, plan});
     } catch (e) {
@@ -3005,8 +3070,11 @@ dropPlanOnChange(['groupNumber', 'groupName', 'groupMembers', 'groupFallback'], 
   showStalePlan('groupPlanMsgSingle', 'groupPlanListSingle', 'groupConfirmRowSingle');
 });
 dropPlanOnChange(['deleteExt'], () => {
-  if (currentDeletePlans.length === 0) return;
+  const building = document.getElementById('deletePlanMsg').textContent.startsWith('Ищу');
+  deletePlanRequest++;  // a plan still being built is for the numbers as they were
+  if (currentDeletePlans.length === 0 && !building) return;
   currentDeletePlans = [];
+  askToDelete('', 0);
   showStalePlan('deletePlanMsg', 'deletePlanList', 'deleteConfirmRow');
 });
 dropPlanOnChange(['roleName'], () => {
@@ -3377,10 +3445,12 @@ class Handler(BaseHTTPRequestHandler):
                 if not _may_read_journal(op):
                     self._send_json(403, {"error": "Журнал виден после входа в Webitel"})
                     return
-                offset = body.get("offset")
+                offset, limit = body.get("offset"), body.get("limit")
                 if not isinstance(offset, int) or offset < 0:
                     offset = 0
-                self._send_json(200, _read_journal(str(body.get("query") or ""), offset))
+                if limit not in _JOURNAL_LIMITS:
+                    limit = 25
+                self._send_json(200, _read_journal(str(body.get("query") or ""), offset, limit))
                 return
 
             if self.path == "/api/webitel/session_status":
