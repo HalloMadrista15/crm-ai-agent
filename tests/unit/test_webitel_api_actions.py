@@ -9,7 +9,13 @@ import unittest
 from io import BytesIO
 from unittest.mock import patch
 
-from crm_ai_agent.adapters.webitel_api.actions import WebitelApiActions, WebitelApiError, generate_password, group_schema
+from crm_ai_agent.adapters.webitel_api.actions import (
+    WebitelApiActions,
+    WebitelApiError,
+    WebitelNoAnswerError,
+    generate_password,
+    group_schema,
+)
 from crm_ai_agent.adapters.webitel_api.session import WebitelApiSession
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
 
@@ -864,6 +870,7 @@ class TestExecuteDeletePlan(unittest.TestCase):
             result,
             {
                 "deleted": True,
+                "already_deleted": False,
                 "id": "6078",
                 "extension": "10087",
                 "name": "Test User 10087",
@@ -879,35 +886,6 @@ class TestExecuteDeletePlan(unittest.TestCase):
         self.assertEqual(delete_request.get_method(), "DELETE")
         self.assertIn("permanent=true", delete_request.full_url)
         self.assertIn("/api/users/6078", delete_request.full_url)
-
-    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
-    def test_deletes_devices_before_deleting_the_user(self, mock_urlopen) -> None:
-        plan = {"extension": "10087", "id": "6078", "name": "Test User 10087", "device_ids": ["150443", "150444"]}
-        mock_urlopen.side_effect = [
-            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # re-fetch search
-            _FakeResponse({"id": "6078", "extension": "10087", "name": "Test User 10087"}),  # re-fetch full
-            _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]}),  # presence re-check: idle
-            _FakeResponse({}),  # POST .../logout
-            _FakeResponse({}),  # DELETE device 150443
-            _FakeResponse({}),  # DELETE device 150444
-            _FakeResponse(""),  # DELETE user
-        ]
-
-        result = _actions().execute_delete_plan(plan)
-
-        self.assertEqual(result["deleted_device_ids"], ["150443", "150444"])
-
-        device_delete_1 = mock_urlopen.call_args_list[4].args[0]
-        self.assertEqual(device_delete_1.get_method(), "DELETE")
-        self.assertIn("/api/devices/150443", device_delete_1.full_url)
-
-        device_delete_2 = mock_urlopen.call_args_list[5].args[0]
-        self.assertEqual(device_delete_2.get_method(), "DELETE")
-        self.assertIn("/api/devices/150444", device_delete_2.full_url)
-
-        user_delete = mock_urlopen.call_args_list[6].args[0]
-        self.assertEqual(user_delete.get_method(), "DELETE")
-        self.assertIn("/api/users/6078", user_delete.full_url)
 
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_logout_happens_before_delete_even_when_idle(self, mock_urlopen) -> None:
@@ -979,6 +957,225 @@ class TestExecuteDeletePlan(unittest.TestCase):
         ]
         with self.assertRaises(WebitelApiError):
             _actions().execute_delete_plan(plan)
+
+
+def _http_error(code: int, body: str) -> Exception:
+    import urllib.error
+
+    return urllib.error.HTTPError(url="x", code=code, msg="x", hdrs=None, fp=BytesIO(body.encode("utf-8")))
+
+
+# As Webitel answered (2026-11-23; the two refusals — from the console's log).
+def _user_404() -> Exception:
+    return _http_error(404, '{"id":"app.user.not_found.err","code":404,"detail":"user: object id=6078 does not exist '
+                            'or you have not enough privileges","status":"Not Found"}')
+
+
+def _device_404() -> Exception:
+    return _http_error(404, '{"id":"app.device.not_found","code":404,"detail":"device: lookup {id:150443} found nothing",'
+                            '"status":"Not Found"}')
+
+
+def _refused_by(table: str) -> Exception:
+    return _http_error(502, '{"id":"api.webitel.error","code":502,"detail":"ERROR: update or delete on table \\"wbt_user\\" '
+                            f'violates foreign key constraint \\"{table}_wbt_user_id_fk\\" on table \\"{table}\\" '
+                            '(SQLSTATE 23503)","status":"Bad Gateway"}')
+
+
+def _no_answer() -> Exception:
+    return TimeoutError("The read operation timed out")
+
+
+@patch("crm_ai_agent.adapters.webitel_api.actions.time.sleep")
+@patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+class TestDeletionThatGoesWrong(unittest.TestCase):
+    """Every way a deletion failed between October and November 2026 (54 of
+    217), by the console's own log."""
+
+    PLAN = {"extension": "10087", "id": "6078", "name": "Test", "device_ids": ["150443"]}
+
+    @staticmethod
+    def _idle() -> _FakeResponse:
+        return _FakeResponse({"items": [{"id": "6078", "extension": "10087"}]})
+
+    def _found(self) -> list[_FakeResponse]:
+        return [self._idle(), _FakeResponse({"id": "6078", "extension": "10087", "name": "Test"})]
+
+    @staticmethod
+    def _device(owner: str = "6078") -> _FakeResponse:
+        return _FakeResponse({"id": "150443", "name": "10087", "account": "10087", **({"user": {"id": owner}} if owner else {})})
+
+    @staticmethod
+    def _writes(mock_urlopen) -> list[str]:
+        return [
+            f"{c.args[0].get_method()} {c.args[0].full_url.split('/api/')[1].split('?')[0]}"
+            for c in mock_urlopen.call_args_list if c.args[0].get_method() != "GET"
+        ]
+
+    def test_the_user_goes_before_the_device(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(), self._idle(), _FakeResponse({}), _FakeResponse({}),  # logout, user
+            self._device(owner=""), _FakeResponse({}),  # no owner any more
+        ]
+        result = _actions().execute_delete_plan(self.PLAN)
+        self.assertEqual(self._writes(mock_urlopen), ["POST users/6078/logout", "DELETE users/6078", "DELETE devices/150443"])
+        self.assertEqual(result["deleted_device_ids"], ["150443"])
+        self.assertNotIn("devices_error", result)
+
+    def test_a_user_that_could_not_be_deleted_keeps_the_phone(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [*self._found(), self._idle(), _FakeResponse({}), _refused_by("cc_agent")]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(self.PLAN)
+        self.assertIn("агент колл-центра", str(ctx.exception))
+        self.assertEqual(self._writes(mock_urlopen), ["POST users/6078/logout", "DELETE users/6078"])  # once, no retries
+
+    def test_a_device_deleted_by_an_earlier_attempt_is_no_obstacle(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [*self._found(), self._idle(), _FakeResponse({}), _FakeResponse({}), _device_404()]
+        result = _actions().execute_delete_plan(self.PLAN)
+        self.assertEqual((result["deleted"], result["deleted_device_ids"]), (True, ["150443"]))
+        self.assertNotIn("devices_error", result)
+
+    def test_pressed_again_after_the_user_is_gone_it_finishes_the_devices(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [_FakeResponse({"items": []}), self._device(owner=""), _FakeResponse({})]
+        result = _actions().execute_delete_plan(self.PLAN)
+        self.assertIs(result["already_deleted"], True)
+        self.assertEqual(self._writes(mock_urlopen), ["DELETE devices/150443"])
+
+    def test_a_device_that_is_someone_elses_by_now_is_left_alone(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [*self._found(), self._idle(), _FakeResponse({}), _FakeResponse({}), self._device(owner="7000")]
+        result = _actions().execute_delete_plan(self.PLAN)
+        self.assertEqual((result["deleted"], result["deleted_device_ids"]), (True, []))
+        self.assertIn("у другого пользователя", result["devices_error"])
+        self.assertNotIn("DELETE devices/150443", self._writes(mock_urlopen))
+
+    def test_no_answer_but_the_user_is_gone_means_deleted(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(), self._idle(), _FakeResponse({}), _no_answer(), _user_404(), self._device(owner=""), _FakeResponse({}),
+        ]
+        result = _actions().execute_delete_plan(self.PLAN)
+        self.assertEqual((result["deleted"], result["deleted_device_ids"]), (True, ["150443"]))
+
+    def test_no_answer_and_the_user_is_still_there_is_an_error(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(), self._idle(), _FakeResponse({}), _no_answer(), _FakeResponse({"id": "6078", "extension": "10087"}),
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(self.PLAN)
+        self.assertIn("пока не удалил", str(ctx.exception))
+        self.assertNotIn("DELETE devices/150443", self._writes(mock_urlopen))
+
+    def test_a_delete_is_given_far_longer_than_other_requests(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [*self._found(), self._idle(), _FakeResponse({}), _FakeResponse({}), self._device(), _FakeResponse({})]
+        _actions().execute_delete_plan(self.PLAN)
+        waits = {
+            f"{c.args[0].get_method()} {c.args[0].full_url.split('/api/')[1].split('?')[0]}": c.kwargs["timeout"]
+            for c in mock_urlopen.call_args_list
+        }
+        self.assertEqual((waits["DELETE users/6078"], waits["DELETE devices/150443"], waits["GET devices/150443"]), (90, 90, 15))
+
+    def test_a_404_for_lack_of_rights_is_not_taken_for_deleted(self, mock_urlopen, _sleep) -> None:
+        """Webitel's 404 is "does not exist OR you have not enough privileges"."""
+        mock_urlopen.side_effect = [
+            *self._found(), self._idle(), _FakeResponse({}), _user_404(), _FakeResponse({"id": "6078", "extension": "10087"}),
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(self.PLAN)
+        self.assertIn("HTTP 404", str(ctx.exception))
+        self.assertNotIn("DELETE devices/150443", self._writes(mock_urlopen))
+
+    def test_a_web_session_still_closing_is_waited_out(self, mock_urlopen, sleep) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(),
+            self._idle(), _FakeResponse({}), _refused_by("socket_session"),
+            self._idle(), _FakeResponse({}), _FakeResponse({}),
+            self._device(owner=""), _FakeResponse({}),
+        ]
+        result = _actions().execute_delete_plan(self.PLAN)
+        self.assertIs(result["deleted"], True)
+        sleep.assert_called_once_with(3)
+        self.assertEqual(self._writes(mock_urlopen)[:4], ["POST users/6078/logout", "DELETE users/6078"] * 2)
+
+    def test_a_web_session_that_never_closes_is_given_up_on(self, mock_urlopen, sleep) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(), *[r for _ in range(3) for r in (self._idle(), _FakeResponse({}), _refused_by("socket_session"))],
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(self.PLAN)
+        self.assertIn("открыта сессия", str(ctx.exception))
+        self.assertEqual(sleep.call_count, 2)
+        self.assertNotIn("DELETE devices/150443", self._writes(mock_urlopen))
+
+    def test_a_call_that_starts_while_waiting_stops_the_deletion(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [
+            *self._found(), self._idle(), _FakeResponse({}), _refused_by("socket_session"),
+            _FakeResponse({"items": [{"id": "6078", "extension": "10087", "presence": {"status": "{web,dlg}"}}]}),
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(self.PLAN)
+        self.assertIn("Dlg", str(ctx.exception))
+        self.assertEqual(self._writes(mock_urlopen), ["POST users/6078/logout", "DELETE users/6078"])  # not logged out again
+
+    def test_no_answer_to_the_logout_deletes_nothing(self, mock_urlopen, _sleep) -> None:
+        mock_urlopen.side_effect = [*self._found(), self._idle(), _no_answer()]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_delete_plan(self.PLAN)
+        self.assertIn("ничего не удалено", str(ctx.exception))
+        self.assertEqual(self._writes(mock_urlopen), ["POST users/6078/logout"])
+
+
+class TestNoAnswer(unittest.TestCase):
+    """No answer while reading used to get out as a bare TimeoutError, past
+    everything that reports what was already done."""
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_is_a_webitel_error_however_it_happens(self, mock_urlopen) -> None:
+        import http.client
+        import urllib.error
+
+        class _Stalls(_FakeResponse):
+            def read(self) -> bytes:
+                raise TimeoutError("The read operation timed out")
+
+        calls = {
+            "GET": lambda a: a._get("/x"), "PUT": lambda a: a._put("/x", {}), "PATCH": lambda a: a._patch("/x", []),
+            "POST": lambda a: a._post("/x", {}), "DELETE": lambda a: a._delete("/x"),
+        }
+        for method, call in calls.items():
+            for failure in (_no_answer(), _Stalls({}), http.client.RemoteDisconnected("closed"), ConnectionResetError(10054, "reset"),
+                            urllib.error.URLError(TimeoutError("timed out"))):
+                mock_urlopen.side_effect = [failure]
+                with self.assertRaises(WebitelNoAnswerError, msg=(method, failure)) as ctx:
+                    call(_actions())
+                self.assertIn("не ответил", str(ctx.exception))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_an_unreachable_webitel_and_an_error_answer_are_not_that(self, mock_urlopen) -> None:
+        import urllib.error
+
+        for failure in (urllib.error.URLError(ConnectionRefusedError(10061, "refused")), _http_error(401, "{}")):
+            mock_urlopen.side_effect = [failure]
+            with self.assertRaises(WebitelApiError) as ctx:
+                _actions()._get("/x")
+            self.assertNotIsInstance(ctx.exception, WebitelNoAnswerError)
+        self.assertEqual((str(ctx.exception), ctx.exception.status), ("GET /x failed: HTTP 401", 401))
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_device_that_does_not_answer_no_longer_loses_the_new_password(self, mock_urlopen) -> None:
+        user = {"id": "6197", "name": "TEST1", "extension": "30120", "devices": [{"id": "150571", "name": "30120"}]}
+        reset = [
+            _FakeResponse({"items": [{"id": "6197", "extension": "30120"}]}), _FakeResponse(user),
+            _FakeResponse({}),  # the user's password is set
+            _FakeResponse({"id": "150571", "name": "30120", "account": "30120"}), _no_answer(),  # the device's is not
+        ]
+        mock_urlopen.side_effect = reset
+        result = _actions().execute_password_plan({"extension": "30120", "id": "6197"})
+        self.assertRegex(result["new_password"], _PASSWORD_FORMAT)
+        self.assertIn("не ответил", result["devices_error"])
+
+        mock_urlopen.side_effect = [_FakeResponse(TARGET_USER), _FakeResponse({}), _no_answer()]
+        result = _actions().execute_plan({"target_id": "9999", "roles": [], "license": [], "group": "x", "reset_password": True})
+        self.assertRegex(result["new_password"], _PASSWORD_FORMAT)
+        self.assertIn("не ответил", result["devices_error"])
 
 
 class TestPasswordReset(unittest.TestCase):

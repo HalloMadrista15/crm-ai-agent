@@ -50,10 +50,12 @@ Safety posture, matching everything built so far:
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 import secrets
 import string
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -64,6 +66,12 @@ from crm_ai_agent.adapters.webitel_api.session import WebitelApiSession, load_se
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
 
 _REQUEST_TIMEOUT_SECONDS = 15
+# Webitel can take much longer over a delete: the five users whose delete
+# timed out after 15 s on 2026-10-29 were all still there on 2026-11-23.
+_DELETE_TIMEOUT_SECONDS = 90
+# How often a delete is tried while the user's web session is closing.
+_SESSION_ATTEMPTS = 3
+_SESSION_WAIT_SECONDS = 3
 
 # Letters and digits only, without 0, o and O (2026-10-16 operator request):
 # a password read off the screen or dictated to a colleague mixes them up.
@@ -200,7 +208,25 @@ def _load_env_file(path: Path) -> dict[str, str]:
 
 
 class WebitelApiError(Exception):
-    pass
+    """``status`` and ``detail`` are Webitel's own HTTP status and response
+    body, when it answered."""
+
+    def __init__(self, message: str, *, status: int | None = None, detail: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.detail = detail
+
+
+class WebitelNoAnswerError(WebitelApiError):
+    """Webitel didn't answer in time, or hung up: whether it did what it was
+    asked is unknown."""
+
+
+def _error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        return exc.read().decode("utf-8", errors="replace")
+    except (OSError, http.client.HTTPException):
+        return ""
 
 
 class WebitelApiActions:
@@ -223,73 +249,50 @@ class WebitelApiActions:
             raise ValueError(f"Missing {key} in {info_env_path}")
         return cls(base_url=base_url, session=load_session(storage_state_path))
 
-    def _get(self, path: str) -> Any:
-        url = f"{self._base_url}{path}"
-        request = urllib.request.Request(url, headers=self._session.headers(), method="GET")
+    def _request(self, method: str, path: str, body: Any = None, *, timeout: float = _REQUEST_TIMEOUT_SECONDS) -> bytes:
+        """The one place requests are sent. Every failure is a
+        WebitelApiError, no answer in time included: urllib lets that one
+        through as a bare TimeoutError, which the callers that must still
+        report what was already done (a password already set) don't catch."""
+        headers = dict(self._session.headers())
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(f"{self._base_url}{path}", data=payload, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                return json.loads(response.read())
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.read()
         except urllib.error.HTTPError as exc:
-            raise WebitelApiError(f"GET {path} failed: HTTP {exc.code}") from exc
+            detail = _error_detail(exc)
+            message = f"{method} {path} failed: HTTP {exc.code}"
+            if method != "GET":
+                message += f": {detail}"
+            raise WebitelApiError(message, status=exc.code, detail=detail) from exc
         except urllib.error.URLError as exc:
-            raise WebitelApiError(f"GET {path} failed: {exc.reason}") from exc
+            if isinstance(exc.reason, TimeoutError):
+                raise WebitelNoAnswerError(f"{method} {path}: Webitel не ответил ({exc.reason})") from exc
+            raise WebitelApiError(f"{method} {path} failed: {exc.reason}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            raise WebitelNoAnswerError(f"{method} {path}: Webitel не ответил ({exc or type(exc).__name__})") from exc
+
+    def _get(self, path: str) -> Any:
+        return json.loads(self._request("GET", path))
 
     def _put(self, path: str, body: dict[str, Any]) -> Any:
-        url = f"{self._base_url}{path}"
-        payload = json.dumps(body).encode("utf-8")
-        headers = {**self._session.headers(), "Content-Type": "application/json"}
-        request = urllib.request.Request(url, data=payload, headers=headers, method="PUT")
-        try:
-            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                raw = response.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise WebitelApiError(f"PUT {path} failed: HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise WebitelApiError(f"PUT {path} failed: {exc.reason}") from exc
+        raw = self._request("PUT", path, body)
+        return json.loads(raw) if raw else {}
 
     def _patch(self, path: str, body: Any) -> Any:
-        url = f"{self._base_url}{path}"
-        payload = json.dumps(body).encode("utf-8")
-        headers = {**self._session.headers(), "Content-Type": "application/json"}
-        request = urllib.request.Request(url, data=payload, headers=headers, method="PATCH")
-        try:
-            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                raw = response.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise WebitelApiError(f"PATCH {path} failed: HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise WebitelApiError(f"PATCH {path} failed: {exc.reason}") from exc
+        raw = self._request("PATCH", path, body)
+        return json.loads(raw) if raw else {}
 
-    def _delete(self, path: str) -> None:
-        url = f"{self._base_url}{path}"
-        request = urllib.request.Request(url, headers=self._session.headers(), method="DELETE")
-        try:
-            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                response.read()
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise WebitelApiError(f"DELETE {path} failed: HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise WebitelApiError(f"DELETE {path} failed: {exc.reason}") from exc
+    def _delete(self, path: str, *, timeout: float = _REQUEST_TIMEOUT_SECONDS) -> None:
+        self._request("DELETE", path, timeout=timeout)
 
-    def _post(self, path: str, body: dict[str, Any]) -> Any:
-        url = f"{self._base_url}{path}"
-        payload = json.dumps(body).encode("utf-8")
-        headers = {**self._session.headers(), "Content-Type": "application/json"}
-        request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
-                raw = response.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise WebitelApiError(f"POST {path} failed: HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise WebitelApiError(f"POST {path} failed: {exc.reason}") from exc
+    def _post(self, path: str, body: dict[str, Any], *, timeout: float = _REQUEST_TIMEOUT_SECONDS) -> Any:
+        raw = self._request("POST", path, body, timeout=timeout)
+        return json.loads(raw) if raw else {}
 
     def check_session(self) -> None:
         """Read-only: the cheapest authenticated request, so the console can
@@ -824,12 +827,53 @@ class WebitelApiActions:
         }
 
     def execute_delete_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
-        """Permanently deletes the user and every device listed in the
+        """Permanently deletes the user, then every device listed in the
         plan. Re-fetches by extension right before deleting (never trusts
         the plan-time id) so a since-changed or since-reassigned extension
         can't cause the wrong record to be removed — see module docstring.
 
-        Always logs the user out of every device first (real endpoint
+        The user goes first (since 2026-11-23): the other way round, a user
+        Webitel then refused to delete was left without a phone, and the
+        next attempt stopped at the device that was already gone. So a user
+        that couldn't be deleted is left as it was, and a device that
+        couldn't comes back as ``devices_error`` in the result.
+
+        Can be repeated: what an earlier attempt already deleted counts as
+        deleted (``already_deleted`` for the user)."""
+
+        try:
+            fresh = self.get_raw_user(plan["extension"])
+        except SubjectNotFoundError:
+            fresh = None
+        if fresh is not None and fresh["id"] != plan["id"]:
+            raise WebitelApiError(
+                f"extension={plan['extension']!r} now belongs to a different user "
+                f"(id {fresh['id']!r}, was {plan['id']!r} when the plan was built) — refusing to delete"
+            )
+        if fresh is not None:
+            self._delete_user(plan)
+
+        deleted_devices: list[str] = []
+        errors: list[str] = []
+        for device_id in plan.get("device_ids", []):
+            try:
+                self._delete_device_of(plan["id"], device_id)
+            except WebitelApiError as exc:
+                errors.append(str(exc))
+                continue
+            deleted_devices.append(device_id)
+        result = {
+            "deleted": True,
+            "already_deleted": fresh is None,
+            "id": plan["id"],
+            "extension": plan["extension"],
+            "name": plan.get("name", ""),
+            "deleted_device_ids": deleted_devices,
+        }
+        return {**result, "devices_error": "; ".join(errors)} if errors else result
+
+    def _delete_user(self, plan: dict[str, Any]) -> None:
+        """Always logs the user out of every device first (real endpoint
         ``POST /api/users/{id}/logout``, confirmed 2026-09-21 from
         Webitel's own "End all sessions" button — same request shape the
         UI itself sends). Confirmed the same day: deleting a user with an
@@ -840,36 +884,76 @@ class WebitelApiActions:
         presence_status warning was non-empty (which could be stale by
         confirm time anyway).
 
-        Devices are deleted using the same
-        ``DELETE /api/devices/{id}?permanent=true`` shape as users
-        (confirmed 2026-09-21 by testing it against a real orphaned
-        device) — using plan['device_ids'] rather than re-fetching, since
-        the user is about to be deleted anyway and a device re-fetch would
-        need the user to still exist to look it up by extension."""
+        An open web session can outlive the logout by a moment, and Webitel
+        then refuses the delete (``socket_session``): that one is tried
+        again. A call center agent (``cc_agent``) it refuses for good."""
+        path = f"/api/users/{plan['id']}"
+        for attempt in range(_SESSION_ATTEMPTS):
+            if attempt:
+                time.sleep(_SESSION_WAIT_SECONDS)
+            # Re-checked here, not trusted from the plan: a call may have
+            # started since "Показать план". Logging out would drop it.
+            try:
+                status = self.get_presence_status(plan["extension"])
+            except SubjectNotFoundError:
+                return
+            if "Dlg" in self.presence_labels(status):
+                raise WebitelApiError(
+                    f"{plan['extension']} сейчас в разговоре (Dlg) — удаление отменено, повторите после окончания звонка"
+                )
+            try:
+                self._post(f"{path}/logout", {}, timeout=_DELETE_TIMEOUT_SECONDS)
+            except WebitelNoAnswerError as exc:
+                raise WebitelApiError("Webitel не ответил при завершении сессий — ничего не удалено, повторите") from exc
+            try:
+                return self._delete_for_sure(path)
+            except WebitelApiError as exc:
+                if "cc_agent" in exc.detail:
+                    raise WebitelApiError("это агент колл-центра — сначала удалите его из агентов в Webitel") from exc
+                if "socket_session" not in exc.detail:
+                    raise
+        raise WebitelApiError("у пользователя открыта сессия Webitel и не закрывается — повторите позже")
 
-        fresh = self.get_raw_user(plan["extension"])
-        if fresh["id"] != plan["id"]:
-            raise WebitelApiError(
-                f"extension={plan['extension']!r} now belongs to a different user "
-                f"(id {fresh['id']!r}, was {plan['id']!r} when the plan was built) — refusing to delete"
-            )
-        # Re-checked here, not trusted from the plan: a call may have
-        # started since "Показать план". Logging out would drop it.
-        if "Dlg" in self.presence_labels(self.get_presence_status(plan["extension"])):
-            raise WebitelApiError(
-                f"{plan['extension']} сейчас в разговоре (Dlg) — удаление отменено, повторите после окончания звонка"
-            )
-        self._post(f"/api/users/{plan['id']}/logout", {})
-        for device_id in plan.get("device_ids", []):
-            self._delete(f"/api/devices/{device_id}?permanent=true")
-        self._delete(f"/api/users/{plan['id']}?permanent=true")
-        return {
-            "deleted": True,
-            "id": plan["id"],
-            "extension": plan["extension"],
-            "name": plan.get("name", ""),
-            "deleted_device_ids": plan.get("device_ids", []),
-        }
+    def _delete_device_of(self, user_id: str, device_id: str) -> None:
+        """One device from a delete plan, unless it is someone else's by now.
+        ``DELETE /api/devices/{id}?permanent=true`` has the same shape as
+        for users (confirmed 2026-09-21 on a real orphaned device)."""
+        path = f"/api/devices/{device_id}"
+        try:
+            device = self._get(path)
+        except WebitelApiError as exc:
+            if exc.status == 404:
+                return
+            raise
+        owner = (device.get("user") or {}).get("id")
+        if owner and str(owner) != str(user_id):
+            raise WebitelApiError(f"устройство {device.get('name') or device_id} теперь у другого пользователя — не удалено")
+        self._delete_for_sure(path)
+
+    def _delete_for_sure(self, path: str) -> None:
+        """A DELETE that ends in a known state. No answer in time says
+        nothing about the outcome, and Webitel's 404 means "does not exist
+        or you have not enough privileges" (seen 2026-11-23), so after
+        either the record is looked up: if it's gone, it's deleted."""
+        try:
+            self._delete(f"{path}?permanent=true", timeout=_DELETE_TIMEOUT_SECONDS)
+        except WebitelNoAnswerError as exc:
+            if not self._is_gone(path):
+                raise WebitelApiError(
+                    f"Webitel не ответил за {_DELETE_TIMEOUT_SECONDS} с и пока не удалил — повторите позже"
+                ) from exc
+        except WebitelApiError as exc:
+            if exc.status != 404 or not self._is_gone(path):
+                raise
+
+    def _is_gone(self, path: str) -> bool:
+        try:
+            self._get(path)
+        except WebitelApiError as exc:
+            if exc.status == 404:
+                return True
+            raise
+        return False
 
     def build_password_plan(self, extension: str) -> dict[str, Any]:
         """Read-only: whose password a reset changes, which devices get the

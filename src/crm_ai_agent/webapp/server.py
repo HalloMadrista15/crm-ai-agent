@@ -634,7 +634,7 @@ _INDEX_HTML = """<!doctype html>
   .list .field.list-error{background:var(--danger-soft);border-color:rgba(240,90,75,.3);}
   .list .field.list-error .k{color:var(--danger-dark);}
   .list .field.list-ok .status{color:var(--lime);font-weight:600;}
-  .secret{font-family:var(--mono);color:var(--lime);user-select:all;letter-spacing:.02em;}
+  .secret{display:inline-block;padding:2px 10px;border-radius:8px;background:var(--lime-soft);border:1px solid rgba(184,242,108,.35);font-family:var(--mono);font-size:14px;font-weight:600;color:var(--lime);user-select:all;letter-spacing:.02em;}
   .list .field.list-warn{background:var(--amber-bg);border-color:rgba(245,170,61,.35);}
   .list .field.list-warn .status{color:var(--text);font-weight:600;}
   .presence{display:block;margin-top:3px;font-size:12px;}
@@ -2179,19 +2179,29 @@ document.getElementById('btnDeleteExecute').addEventListener('click', async () =
   if (!confirm(text)) return;
   btn.disabled = true;
   msgEl.className = 'msg info';
-  msgEl.textContent = 'Удаляю...';
   const results = [];
-  for (const r of toDelete) {
+  const failed = [];
+  for (const [done, r] of toDelete.entries()) {
+    msgEl.textContent = `Удаляю ${done + 1} из ${toDelete.length}...`;
+    const who = `<span class="k">${esc(label(r))}</span>`;
     try {
       const result = await api('/api/webitel/delete_execute', {plan: r.plan});
       const deviceNote = result.deleted_device_ids.length > 0 ? ` (устройств удалено: ${result.deleted_device_ids.length})` : '';
-      results.push(`<div class="field list-ok"><span class="k">${result.name} (${result.extension})</span>` +
-        `<span class="v status">✓ удалён${deviceNote}</span></div>`);
+      const text = `✓ ${result.already_deleted ? 'уже был удалён' : 'удалён'}${deviceNote}`;
+      if (result.devices_error) failed.push(r);
+      results.push(result.devices_error
+        ? `<div class="field list-warn">${who}<span class="v status">${text} · устройство НЕ удалено: ${esc(result.devices_error)}</span></div>`
+        : `<div class="field list-ok">${who}<span class="v status">${text}</span></div>`);
     } catch (e) {
-      results.push(`<div class="field list-error"><span class="k">${r.plan.name} (${r.plan.extension})</span>` +
-        `<span class="v">${e.message}</span></div>`);
+      failed.push(r);
+      results.push(`<div class="field list-error">${who}<span class="v">${esc(e.message)}</span></div>`);
     }
   }
+  // Only what didn't work out stays for another try: pressing the button
+  // again used to ask Webitel to delete everyone a second time.
+  currentDeletePlans = failed;
+  btn.textContent = `Повторить (${failed.length})`;
+  document.getElementById('deleteConfirmRow').hidden = failed.length === 0;
   msgEl.className = 'msg info';
   msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
   btn.disabled = false;
@@ -2402,7 +2412,7 @@ document.getElementById('btnCreateExecuteSingle').addEventListener('click', asyn
   try {
     const result = await api('/api/webitel/create_execute', {plan: currentCreatePlanSingle});
     msgEl.className = 'msg info';
-    msgEl.innerHTML = `Готово. ${result.name} (${result.extension}) создан. Общий пароль: <b>${result.temporary_password}</b>${permissionsResultNote(result)}`;
+    msgEl.innerHTML = `Готово. ${esc(result.name)} (${esc(result.extension)}) создан. Общий пароль: <b class="secret">${esc(result.temporary_password)}</b>${permissionsResultNote(result)}`;
   } catch (e) {
     msgEl.textContent = 'Ошибка: ' + e.message;
     msgEl.className = 'msg error';
@@ -2564,7 +2574,7 @@ document.getElementById('btnCreateExecute').addEventListener('click', async () =
     try {
       const result = await api('/api/webitel/create_execute', {plan: r.plan});
       results.push(`<div class="field ${result.permissions_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v status">✓ общий пароль: ${result.temporary_password}${permissionsResultNote(result)}</span></div>`);
+        `<span class="v status">✓ общий пароль: <b class="secret">${esc(result.temporary_password)}</b>${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
       results.push(`<div class="field list-error"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
         `<span class="v">${e.message}</span></div>`);
@@ -2744,6 +2754,11 @@ dropPlanOnChange(['groupNumber', 'groupName', 'groupMembers', 'groupFallback'], 
   if (groupPlans.Single.length === 0) return;
   groupPlans.Single = [];
   showStalePlan('groupPlanMsgSingle', 'groupPlanListSingle', 'groupConfirmRowSingle');
+});
+dropPlanOnChange(['deleteExt'], () => {
+  if (currentDeletePlans.length === 0) return;
+  currentDeletePlans = [];
+  showStalePlan('deletePlanMsg', 'deletePlanList', 'deleteConfirmRow');
 });
 dropPlanOnChange(['roleName'], () => {
   if (!currentRolePlan) return;
