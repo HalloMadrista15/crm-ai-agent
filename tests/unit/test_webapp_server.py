@@ -444,6 +444,93 @@ class TestSharedConsole(unittest.TestCase):
         path = self.root / "audit.jsonl"
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
+    def _workspace_env(self, cookie: str) -> Path:
+        return self.root / "operators" / server._workspace_id(cookie.split("=", 1)[1]) / "info.env"
+
+    def test_saved_passwords_are_encrypted_on_disk_and_still_used(self) -> None:
+        cookie = self._new_browser()
+        self._post("/api/crm/login", {"login": "i.ivanov", "password": "Crm-Pa55", "remember": True}, cookie=cookie)
+        self._post("/api/webitel/credentials/save", {"city": "almaty", "login": "20001", "password": "Alm-Pa55"}, cookie=cookie)
+        self._post("/api/webitel/credentials/save", {"city": "astana", "login": "28001", "password": "Ast-Pa55"}, cookie=cookie)
+
+        stored = self._workspace_env(cookie).read_text(encoding="utf-8")
+        for password in ("Crm-Pa55", "Alm-Pa55", "Ast-Pa55"):
+            self.assertNotIn(password, stored)
+        self.assertEqual(stored.count("enc1:"), 3)
+        self.assertIn("CRM_LOGIN=i.ivanov", stored)  # only passwords are hidden
+
+        # As after a restart of the console: nothing but the files and the cookie.
+        server._crm_sessions.clear()
+        _, credentials = self._post("/api/crm/credentials", {}, cookie=cookie)
+        self.assertEqual((credentials["login"], credentials["has_password"]), ("i.ivanov", True))
+        with mock.patch.object(_FakeCrm, "start_login", autospec=True) as start_login:
+            status, _ = self._post("/api/crm/login", {}, cookie=cookie)
+        self.assertEqual((status, start_login.call_args.kwargs), (200, {"login": "i.ivanov", "password": "Crm-Pa55"}))
+        for city, login, password in (("almaty", "20001", "Alm-Pa55"), ("astana", "28001", "Ast-Pa55")):
+            config = server.city_config(
+                server._operator_env(server._named_operator(
+                    server._workspace_id(cookie.split("=", 1)[1]), self._key(cookie))), city)
+            self.assertEqual((config["login"], config["password"]), (login, password))
+
+    @staticmethod
+    def _key(cookie: str) -> bytes:
+        from crm_ai_agent.webapp.saved_secrets import workspace_key
+
+        return workspace_key(cookie.split("=", 1)[1])
+
+    def test_a_copied_workspace_file_gives_no_password_to_another_browser(self) -> None:
+        owner, thief = self._new_browser(), self._new_browser()
+        self._post("/api/crm/login", {"login": "i.ivanov", "password": "Crm-Pa55", "remember": True}, cookie=owner)
+        self._workspace_env(thief).write_bytes(self._workspace_env(owner).read_bytes())
+
+        _, credentials = self._post("/api/crm/credentials", {}, cookie=thief)
+        self.assertIs(credentials["has_password"], False)
+        status, payload = self._post("/api/crm/login", {}, cookie=thief)
+        self.assertEqual(status, 400)
+        self.assertIn("не сохранены", payload["error"])
+
+    def test_passwords_saved_before_encryption_are_encrypted_on_the_next_visit(self) -> None:
+        cookie = self._new_browser()
+        path = self._workspace_env(cookie)
+        path.write_text(
+            "CRM_LOGIN=i.ivanov\nCRM_PASSWORD=Crm-Pa55\nCRM_VISA_OWNER_ID=guid\n"
+            "WEBITEL_LOGIN=20001\nWEBITEL_PASSWORD=Alm-Pa55\n", encoding="utf-8",
+        )
+        # A page sends several requests at once; none may lose what was saved.
+        results: list[tuple] = []
+        threads = [
+            threading.Thread(target=lambda: results.append(self._post("/api/crm/credentials", {}, cookie=cookie)))
+            for _ in range(12)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        self.assertEqual(len(results), 12)
+        for status, payload in results:
+            self.assertEqual((status, payload), (200, {"login": "i.ivanov", "has_password": True, "visa_owner_id": "guid"}))
+        stored = path.read_text(encoding="utf-8")
+        self.assertNotIn("Pa55", stored)
+        self.assertEqual(stored.count("enc1:"), 2)
+        for kept in ("CRM_LOGIN=i.ivanov", "CRM_VISA_OWNER_ID=guid", "WEBITEL_LOGIN=20001"):
+            self.assertIn(kept, stored)
+
+        before = path.read_bytes()
+        self._post("/api/crm/credentials", {}, cookie=cookie)
+        self.assertEqual(path.read_bytes(), before)  # encrypted once, not on every request
+
+    def test_another_browsers_visit_does_not_touch_old_passwords(self) -> None:
+        owner, other = self._new_browser(), self._new_browser()
+        self._workspace_env(owner).write_text("CRM_LOGIN=i.ivanov\nCRM_PASSWORD=Crm-Pa55\n", encoding="utf-8")
+        before = self._workspace_env(owner).read_bytes()
+        self._post("/api/crm/credentials", {}, cookie=other)
+        self.assertEqual(self._workspace_env(owner).read_bytes(), before)
+
+    def test_the_key_never_shows_up_when_an_operator_is_printed(self) -> None:
+        op = server._named_operator("ws", b"0123456789abcdef0123456789abcdef")
+        self.assertNotIn("0123456789abcdef", repr(op))
+
     def test_an_address_outside_the_allowed_nets_gets_nothing(self) -> None:
         with mock.patch.object(server, "_ip_allowed", return_value=False):
             with self.assertRaises(urllib.error.HTTPError) as page:
@@ -581,6 +668,18 @@ class TestSharedConsoleConfig(unittest.TestCase):
         self.assertNotEqual(server._exposure_problem("0.0.0.0", True, False), "")
         self.assertEqual(server._exposure_problem("0.0.0.0", True, True), "")
         self.assertEqual(server._exposure_problem("127.0.0.1", False, False), "")
+
+    def test_a_shared_console_does_not_start_without_encryption(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "info.env"
+            env_path.write_text("CONSOLE_SHARED=1\n", encoding="utf-8")
+            with mock.patch.object(server, "INFO_ENV_PATH", env_path), \
+                    mock.patch.dict("sys.modules", {"crm_ai_agent.webapp.saved_secrets": None}), \
+                    mock.patch.object(server, "_ConsoleServer") as listener:
+                with self.assertRaises(SystemExit) as stopped:
+                    server.run(port=0)
+            self.assertIn("шифровать", str(stopped.exception))
+            listener.assert_not_called()
 
     def test_allowed_nets_take_addresses_and_networks(self) -> None:
         nets = server._parse_allowed_nets(" 10.80.0.0/24, 10.70.70.5\n10.90.5.152/29 ")

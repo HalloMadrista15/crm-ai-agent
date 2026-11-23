@@ -7,6 +7,8 @@ name = "crm-ai-agent"
 version = "0.1.0"
 description = "Human-in-the-loop AI agent for CRM/Webitel ticket processing"
 requires-python = ">=3.11"
+# The shared console encrypts the passwords it remembers (webapp/saved_secrets.py).
+dependencies = ["cryptography>=42"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

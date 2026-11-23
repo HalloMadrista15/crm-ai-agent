@@ -38,7 +38,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import escape as html_escape
 from http.cookies import CookieError, SimpleCookie
@@ -70,6 +70,12 @@ _SETTINGS_KEYS = (
     "WEBITEL_ASTANA_LOGIN",
     "WEBITEL_ASTANA_PASSWORD",
 )
+# Kept encrypted on a shared console — see saved_secrets.py.
+_SECRET_KEYS = ("CRM_PASSWORD", "WEBITEL_PASSWORD", "WEBITEL_ASTANA_PASSWORD")
+
+# A page sends several requests at once: none may read an env file another
+# one is halfway through rewriting, or write back what it read before that.
+_env_lock = threading.RLock()
 
 
 def _save_env_updates(path: Path, updates: dict[str, str]) -> None:
@@ -81,20 +87,22 @@ def _save_env_updates(path: Path, updates: dict[str, str]) -> None:
     everyone; only the per-operator keys in _SETTINGS_KEYS are writable
     from this endpoint."""
 
-    existing = _load_env_file(path)
-    for key, value in updates.items():
-        if key not in _SETTINGS_KEYS:
-            continue
-        if value:
-            existing[key] = value
-    _write_env(path, existing)
+    with _env_lock:
+        existing = _load_env_file(path)
+        for key, value in updates.items():
+            if key not in _SETTINGS_KEYS:
+                continue
+            if value:
+                existing[key] = value
+        _write_env(path, existing)
 
 
 def _remove_env_keys(path: Path, keys: tuple[str, ...]) -> None:
-    existing = _load_env_file(path)
-    if not any(key in existing for key in keys):
-        return
-    _write_env(path, {k: v for k, v in existing.items() if k not in keys})
+    with _env_lock:
+        existing = _load_env_file(path)
+        if not any(key in existing for key in keys):
+            return
+        _write_env(path, {k: v for k, v in existing.items() if k not in keys})
 
 
 def _write_env(path: Path, values: dict[str, str]) -> None:
@@ -116,19 +124,66 @@ class _Operator:
     name: str
     env_path: Path
     storage_paths: dict[str, Path]
+    # What this browser's saved passwords are encrypted with. None on a local
+    # console: its info.env also serves scripts/ and is filled in by hand.
+    secret_key: bytes | None = field(default=None, repr=False)
 
 
 def _local_operator() -> _Operator:
     return _Operator("", INFO_ENV_PATH, dict(WEBITEL_STORAGE_STATE_PATHS))
 
 
-def _named_operator(name: str) -> _Operator:
+def _named_operator(name: str, secret_key: bytes | None = None) -> _Operator:
     home = OPERATORS_DIR / name
     return _Operator(
         name,
         home / "info.env",
         {city: home / ".auth" / f"webitel_{city}_storage_state.json" for city in WEBITEL_STORAGE_STATE_PATHS},
+        secret_key,
     )
+
+
+def _own_env(op: _Operator) -> dict[str, str]:
+    """This operator's own saved settings, with the passwords opened. One
+    that doesn't open (a damaged file, another browser's) counts as not
+    saved: the console then asks for it again."""
+    values = _load_env_file(op.env_path)
+    if op.secret_key is None:
+        return values
+    from crm_ai_agent.webapp.saved_secrets import SecretError, is_sealed, unseal
+
+    for key in _SECRET_KEYS:
+        if is_sealed(values.get(key, "")):
+            try:
+                values[key] = unseal(op.secret_key, op.name, key, values[key])
+            except SecretError:
+                del values[key]
+    return values
+
+
+def _save_own_env(op: _Operator, updates: dict[str, str]) -> None:
+    """_save_env_updates into this operator's own settings, the passwords
+    encrypted first."""
+    if op.secret_key is not None:
+        from crm_ai_agent.webapp.saved_secrets import seal
+
+        updates = {
+            key: seal(op.secret_key, op.name, key, value) if key in _SECRET_KEYS and value else value
+            for key, value in updates.items()
+        }
+    _save_env_updates(op.env_path, updates)
+
+
+def _encrypt_old_passwords(op: _Operator) -> None:
+    """Passwords saved as plain text before 2026-11-23 become encrypted the
+    first time their own browser comes back (only it has the key)."""
+    from crm_ai_agent.webapp.saved_secrets import is_sealed
+
+    with _env_lock:
+        values = _load_env_file(op.env_path)
+        plain = {key: values[key] for key in _SECRET_KEYS if values.get(key) and not is_sealed(values[key])}
+        if plain:
+            _save_own_env(op, plain)
 
 
 def _operator_env(op: _Operator) -> dict[str, str]:
@@ -136,7 +191,7 @@ def _operator_env(op: _Operator) -> dict[str, str]:
     operator's own logins — never another operator's, nor logins left in the
     shared info.env from before it became a shared console."""
     shared = {k: v for k, v in _load_env_file(INFO_ENV_PATH).items() if k not in _SETTINGS_KEYS}
-    own = {k: v for k, v in _load_env_file(op.env_path).items() if k in _SETTINGS_KEYS}
+    own = {k: v for k, v in _own_env(op).items() if k in _SETTINGS_KEYS}
     return {**shared, **own}
 
 
@@ -181,7 +236,7 @@ def _save_webitel_credentials(op: _Operator, city: str, login: str, password: st
     if not login or not password:
         raise ValueError("Введите и логин, и пароль Webitel")
     keys = WEBITEL_CITY_KEYS[city]
-    _save_env_updates(op.env_path, {keys["login"]: login, keys["password"]: password})
+    _save_own_env(op, {keys["login"]: login, keys["password"]: password})
 
 
 def _forget_webitel_credentials(op: _Operator, city: str) -> None:
@@ -242,9 +297,11 @@ def _get_webitel_actions(op: _Operator, city: str) -> Any:
 
 def _load_env_file(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    if not path.exists():
-        return values
-    for line in path.read_text(encoding="utf-8").splitlines():
+    with _env_lock:
+        if not path.exists():
+            return values
+        text = path.read_text(encoding="utf-8")
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -349,9 +406,9 @@ def _resolve_crm_login(body: dict[str, Any], op: _Operator | None = None) -> tup
                 # The saved Visa Owner ID belonged to the previous account;
                 # dropping it makes the console detect the new one after login.
                 _remove_env_keys(op.env_path, ("CRM_VISA_OWNER_ID",))
-            _save_env_updates(op.env_path, {"CRM_LOGIN": login, "CRM_PASSWORD": password})
+            _save_own_env(op, {"CRM_LOGIN": login, "CRM_PASSWORD": password})
         return login, password
-    env = _load_env_file(op.env_path)
+    env = _own_env(op)
     login, password = env.get("CRM_LOGIN", ""), env.get("CRM_PASSWORD", "")
     if not login or not password:
         raise ValueError("Логин и пароль CRM не сохранены — введите их")
@@ -2832,7 +2889,10 @@ class Handler(BaseHTTPRequestHandler):
         token = self._workspace_token()
         if not token:
             return None
-        op = _named_operator(_workspace_id(token))
+        from crm_ai_agent.webapp.saved_secrets import workspace_key
+
+        op = _named_operator(_workspace_id(token), workspace_key(token))
+        _encrypt_old_passwords(op)
         now = time.time()
         with _workspaces_lock:
             _sweep_idle_workspaces(now)
@@ -2925,7 +2985,7 @@ class Handler(BaseHTTPRequestHandler):
                     "WEBITEL_ASTANA_LOGIN": body.get("webitel_astana_login", "").strip(),
                     "WEBITEL_ASTANA_PASSWORD": body.get("webitel_astana_password", "").strip(),
                 }
-                _save_env_updates(op.env_path, updates)
+                _save_own_env(op, updates)
                 if "crm_visa_owner_id" in body and not updates["CRM_VISA_OWNER_ID"]:
                     # Unlike the passwords, this field is pre-filled with the
                     # saved value, so an empty one means "use my roles".
@@ -2935,7 +2995,7 @@ class Handler(BaseHTTPRequestHandler):
 
             if self.path == "/api/crm/credentials":
                 # Which CRM login is remembered — never the password itself.
-                env = _load_env_file(op.env_path)
+                env = _own_env(op)
                 self._send_json(200, {
                     "login": env.get("CRM_LOGIN", ""),
                     "has_password": bool(env.get("CRM_PASSWORD")),
@@ -3288,6 +3348,14 @@ def run(port: int | None = None) -> None:
     problem = _exposure_problem(host, shared, bool(cert and key))
     if problem:
         raise SystemExit(f"Консоль не запущена: {problem}")
+    if shared:
+        try:
+            import crm_ai_agent.webapp.saved_secrets  # noqa: F401
+        except ImportError as exc:
+            raise SystemExit(
+                f"Консоль не запущена: пароли нечем шифровать ({exc}) — "
+                "выполните .venv/bin/python -m pip install cryptography"
+            ) from exc
     try:
         _ALLOWED_NETS = _parse_allowed_nets(env.get("CONSOLE_ALLOWED_NETS", ""))
     except ValueError as exc:
