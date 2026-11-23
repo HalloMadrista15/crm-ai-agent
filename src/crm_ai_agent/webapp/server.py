@@ -634,7 +634,9 @@ _INDEX_HTML = """<!doctype html>
   .list .field.list-error{background:var(--danger-soft);border-color:rgba(240,90,75,.3);}
   .list .field.list-error .k{color:var(--danger-dark);}
   .list .field.list-ok .status{color:var(--lime);font-weight:600;}
-  .secret{display:inline-block;padding:2px 10px;border-radius:8px;background:var(--lime-soft);border:1px solid rgba(184,242,108,.35);font-family:var(--mono);font-size:14px;font-weight:600;color:var(--lime);user-select:all;letter-spacing:.02em;}
+  .secret{display:inline-block;padding:2px 10px;border-radius:8px;background:var(--lime-soft);border:1px solid rgba(184,242,108,.35);font-family:var(--mono);font-size:14px;font-weight:600;color:var(--lime);user-select:all;letter-spacing:.02em;cursor:pointer;transition:background-color .15s,border-color .15s;}
+  .secret:hover{background:rgba(184,242,108,.2);border-color:rgba(184,242,108,.6);}
+  .secret.copied::after{content:"";display:inline-block;width:17px;height:17px;margin-left:8px;vertical-align:-3px;background:currentColor;-webkit-mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 15 2 2 4-4'/%3E%3Crect x='8' y='8' width='14' height='14' rx='2'/%3E%3Cpath d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'/%3E%3C/svg%3E") center/contain no-repeat;mask:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m12 15 2 2 4-4'/%3E%3Crect x='8' y='8' width='14' height='14' rx='2'/%3E%3Cpath d='M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2'/%3E%3C/svg%3E") center/contain no-repeat;}
   .list .field.list-warn{background:var(--amber-bg);border-color:rgba(245,170,61,.35);}
   .list .field.list-warn .status{color:var(--text);font-weight:600;}
   .presence{display:block;margin-top:3px;font-size:12px;}
@@ -694,6 +696,7 @@ _INDEX_HTML = """<!doctype html>
   pre{background:#121211;border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px 14px;font-size:12px;font-family:var(--mono);overflow-x:auto;white-space:pre-wrap;word-break:break-word;color:var(--text-soft);}
   .msg{font-size:12.5px;margin-top:10px;color:var(--text-soft);overflow-wrap:anywhere;}
   .msg:empty{margin-top:0;}
+  .results-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:14px;}
   .msg.error{color:var(--danger-dark);}
   .msg.info{color:var(--text-soft);}
 
@@ -705,8 +708,9 @@ _INDEX_HTML = """<!doctype html>
   .split-side > .row{margin-top:14px;}
   .split-placeholder{display:none;}
   .login-column{display:flex;flex-direction:column;gap:16px;}
-  .code-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px;padding:11px 16px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;color:var(--text);font-weight:500;}
+  .code-banner{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;padding:11px 16px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;color:var(--text);font-weight:500;}
   .code-banner::before{content:"⚠";color:var(--amber);font-size:15px;margin-right:-4px;}
+  .code-banner button{margin-left:auto;}
   .code-box{margin:12px 0 0;padding:14px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;}
   .code-box input{font-size:18px;letter-spacing:.25em;font-variant-numeric:tabular-nums;font-family:var(--mono);}
   .screenshot-btn{margin-top:10px;}
@@ -789,6 +793,7 @@ _INDEX_HTML = """<!doctype html>
   <span class="topbar-brand">Консоль оператора</span>
 </header>
 <div class="page">
+  <div id="outdatedBanner" class="code-banner" hidden>Консоль обновилась. <button type="button" id="btnReload">Обновить страницу</button></div>
   <div id="crmCodeBanner" class="code-banner" hidden>CRM просит код подтверждения. <button type="button" id="btnGoToCode">Ввести код</button></div>
   <div class="page-head">
     <div>
@@ -1317,20 +1322,26 @@ _INDEX_HTML = """<!doctype html>
 </main>
 
 <script>
+const PAGE_VERSION = '{{PAGE_VERSION}}';
+
 async function api(path, body) {
   const res = await fetch(path, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
+    headers: {'Content-Type': 'application/json', 'X-Console-Version': PAGE_VERSION},
     body: body ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
+    // Never reloads by itself: passwords may still be on the screen.
+    if (data.outdated) document.getElementById('outdatedBanner').hidden = false;
     const err = new Error(data.error || ('HTTP ' + res.status));
     err.data = data;
     throw err;
   }
   return data;
 }
+
+document.getElementById('btnReload').addEventListener('click', () => location.reload());
 
 const navButtons = document.querySelectorAll('.nav-link, .nav-account-btn');
 const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password', 'roles'];
@@ -1865,8 +1876,8 @@ document.getElementById('btnPendingTickets').addEventListener('click', async () 
     }
     msgEl.textContent = 'Найдено: ' + data.tickets.length + ' — нажмите, чтобы открыть:';
     listEl.innerHTML = data.tickets.map(t =>
-      `<div class="field"><span class="k">${t.name}</span>` +
-      `<button type="button" class="open-pending ghost" data-url="${t.url}">Открыть</button></div>`
+      `<div class="field"><span class="k">${esc(t.name)}</span>` +
+      `<button type="button" class="open-pending ghost" data-url="${esc(t.url)}">Открыть</button></div>`
     ).join('');
     listEl.querySelectorAll('.open-pending').forEach(btn => {
       btn.addEventListener('click', () => {
@@ -1902,12 +1913,63 @@ function permissionsResultNote(result) {
 // A reset password as a result line: «общий» unless the device didn't get it.
 function newPasswordNote(result) {
   if (result.devices_error) {
-    return `пароль пользователя: <b class="secret">${esc(result.new_password)}</b> · устройство НЕ обновлено: ${esc(result.devices_error)}`;
+    return `пароль пользователя: <b class="secret" title="Нажмите, чтобы скопировать">${esc(result.new_password)}</b> · устройство НЕ обновлено: ${esc(result.devices_error)}`;
   }
   if (result.devices_updated && result.devices_updated.length === 0) {
-    return `пароль: <b class="secret">${esc(result.new_password)}</b> · устройств нет`;
+    return `пароль: <b class="secret" title="Нажмите, чтобы скопировать">${esc(result.new_password)}</b> · устройств нет`;
   }
-  return `общий пароль: <b class="secret">${esc(result.new_password)}</b>`;
+  return `общий пароль: <b class="secret" title="Нажмите, чтобы скопировать">${esc(result.new_password)}</b>`;
+}
+
+// The same for a user just created: «общий» unless the device wasn't made.
+function createdPasswordNote(result) {
+  const secret = `<b class="secret" title="Нажмите, чтобы скопировать">${esc(result.temporary_password)}</b>`;
+  return result.devices_error
+    ? `Пароль пользователя: ${secret} · устройство НЕ создано: ${esc(result.devices_error)}`
+    : `Общий пароль: ${secret}`;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    // The older way, where the browser won't let the page near the clipboard.
+    const area = document.createElement('textarea');
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    const copied = document.execCommand('copy');
+    area.remove();
+    return copied;
+  }
+}
+
+// A click on a new password copies it.
+document.addEventListener('click', async event => {
+  const secret = event.target.closest('.secret');
+  if (!secret || !await copyText(secret.textContent)) return;
+  secret.classList.add('copied');
+  setTimeout(() => secret.classList.remove('copied'), 1500);
+});
+
+// Result rows, with «Скопировать список» when there are new passwords: a
+// number and a password per line, two columns when pasted into Excel.
+function showResults(msgEl, rows, passwords) {
+  msgEl.className = 'msg info';
+  msgEl.innerHTML = '<div class="results-head">Готово.</div><div class="list">' + rows.join('') + '</div>';
+  if (passwords.length === 0) return;
+  const btn = document.createElement('button');
+  const label = `Скопировать список (${passwords.length})`;
+  btn.type = 'button';
+  btn.className = 'ghost';
+  btn.textContent = label;
+  btn.addEventListener('click', async () => {
+    const copied = await copyText(passwords.map(p => `${p.number}\\t${p.password}`).join('\\n'));
+    btn.textContent = copied ? '✓ Скопировано' : 'Не удалось скопировать';
+    setTimeout(() => { btn.textContent = label; }, 2000);
+  });
+  msgEl.querySelector('.results-head').append(btn);
 }
 
 function esc(value) {
@@ -1949,12 +2011,12 @@ document.getElementById('btnReadTicket').addEventListener('click', async () => {
     const data = await api('/api/crm/ticket', {url});
     msgEl.textContent = '';
     cardEl.innerHTML = `
-      <div class="field"><span class="k">Статус</span><span class="v">${data.status}</span></div>
-      <div class="field"><span class="k">ФИО сотрудника</span><span class="v">${data.employee_full_name}</span></div>
-      <div class="field"><span class="k">Учётная запись</span><span class="v">${data.employee_account}</span></div>
-      <div class="field"><span class="k">Информационная система</span><span class="v">${data.information_system}</span></div>
-      <div class="field"><span class="k">Комментарии</span><span class="v">${data.comment || '—'}</span></div>
-      <div class="field"><span class="k">Логин(ы) Webitel из комментариев</span><span class="v">${data.webitel_logins.join(', ') || 'не найдены — укажите вручную'}</span></div>
+      <div class="field"><span class="k">Статус</span><span class="v">${esc(data.status)}</span></div>
+      <div class="field"><span class="k">ФИО сотрудника</span><span class="v">${esc(data.employee_full_name)}</span></div>
+      <div class="field"><span class="k">Учётная запись</span><span class="v">${esc(data.employee_account)}</span></div>
+      <div class="field"><span class="k">Информационная система</span><span class="v">${esc(data.information_system)}</span></div>
+      <div class="field"><span class="k">Комментарии</span><span class="v">${esc(data.comment || '—')}</span></div>
+      <div class="field"><span class="k">Логин(ы) Webitel из комментариев</span><span class="v">${esc(data.webitel_logins.join(', ') || 'не найдены — укажите вручную')}</span></div>
       ${renderApprovals(data)}
     `;
     cardEl.hidden = false;
@@ -2065,12 +2127,13 @@ document.getElementById('btnPlan').addEventListener('click', async () => {
       const licenseNames = r.plan.license.map(x => x.prod || x.id).join(', ') || '—';
       const passwordNote = r.plan.reset_password ? ' · пароль: будет сброшен (общий)' : ' · пароль: не меняется';
       const permissionsNote = ' · права: ' + (r.plan.copy_permissions ? permissionsText(r.plan.permissions, 'уже как у образца') : 'не копируются');
-      return `<div class="field list-ok"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
-        `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}${passwordNote}${permissionsNote}</span></div>`;
+      return `<div class="field list-ok"><span class="k">${esc(r.plan.target_name)} (${esc(r.plan.target_extension)})</span>` +
+        `<span class="v status">✓ роли: ${esc(roleNames)} · лицензии: ${esc(licenseNames)} · группа: ${esc(r.plan.group || '—')}${passwordNote}${permissionsNote}</span></div>`;
     }
-    return `<div class="field list-error"><span class="k">${r.target}</span><span class="v">${r.error}</span></div>`;
+    return `<div class="field list-error"><span class="k">${esc(r.target)}</span><span class="v">${esc(r.error)}</span></div>`;
   }).join('') + missingRow;
 
+  document.getElementById('btnExecute').textContent = 'Подтвердить и применить все';
   if (okCount > 0) confirmRow.hidden = false;
 });
 
@@ -2085,21 +2148,29 @@ document.getElementById('btnExecute').addEventListener('click', async () => {
   if (!confirm(`Точно применить план к ${toApply.length} пользователям? ${names}${resetNote}${permissionsNote}`)) return;
   btn.disabled = true;
   msgEl.className = 'msg info';
-  msgEl.textContent = 'Применяю...';
   const results = [];
-  for (const r of toApply) {
+  const passwords = [];
+  const failed = [];
+  for (const [done, r] of toApply.entries()) {
+    msgEl.textContent = `Применяю ${done + 1} из ${toApply.length}...`;
+    const who = `<span class="k">${esc(r.plan.target_name)} (${esc(r.plan.target_extension)})</span>`;
     try {
       const result = await api('/api/webitel/execute', {plan: r.plan});
       const passwordNote = result.new_password ? ' · ' + newPasswordNote(result) : '';
-      results.push(`<div class="field ${result.permissions_error || result.devices_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
+      if (result.new_password) passwords.push({number: r.plan.target_extension, password: result.new_password});
+      results.push(`<div class="field ${result.permissions_error || result.devices_error ? 'list-warn' : 'list-ok'}">${who}` +
         `<span class="v status">✓ обновлён${passwordNote}${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
-      results.push(`<div class="field list-error"><span class="k">${r.plan.target_name} (${r.plan.target_extension})</span>` +
-        `<span class="v">${e.message}</span></div>`);
+      failed.push(r);
+      results.push(`<div class="field list-error">${who}<span class="v">${esc(e.message)}</span></div>`);
     }
   }
-  msgEl.className = 'msg info';
-  msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
+  // Only what didn't work out stays for another try: pressing the button
+  // again used to reset everyone's password once more.
+  currentPlans = failed;
+  btn.textContent = `Повторить (${failed.length})`;
+  document.getElementById('confirmRow').hidden = failed.length === 0;
+  showResults(msgEl, results, passwords);
   btn.disabled = false;
 });
 
@@ -2267,9 +2338,11 @@ document.getElementById('btnPasswordExecute').addEventListener('click', async ()
   msgEl.className = 'msg info';
   msgEl.textContent = 'Сбрасываю...';
   const results = [];
+  const passwords = [];
   for (const r of toReset) {
     try {
       const result = await api('/api/webitel/password_execute', {plan: r.plan});
+      passwords.push({number: r.plan.extension, password: result.new_password});
       results.push(`<div class="field ${result.devices_error ? 'list-warn' : 'list-ok'}"><span class="k">${esc(label(r))}</span>` +
         `<span class="v status">✓ ${newPasswordNote(result)}</span></div>`);
     } catch (e) {
@@ -2279,8 +2352,7 @@ document.getElementById('btnPasswordExecute').addEventListener('click', async ()
   // Done with this plan: confirming it again would reset everyone once more.
   currentPasswordPlans = [];
   document.getElementById('passwordConfirmRow').hidden = true;
-  msgEl.className = 'msg info';
-  msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
+  showResults(msgEl, results, passwords);
   btn.disabled = false;
 });
 
@@ -2384,13 +2456,13 @@ document.getElementById('btnCreatePlanSingle').addEventListener('click', async (
     const roleNames = plan.roles.map(r => r.name).join(', ') || '—';
     const licenseIds = plan.license.map(l => l.id).join(', ') || '—';
     cardEl.innerHTML = `
-      <div class="field"><span class="k">Образец</span><span class="v">${plan.template_name} (${plan.template_extension})</span></div>
-      <div class="field"><span class="k">Новый пользователь</span><span class="v">${plan.new_name} (${plan.new_username})</span></div>
-      <div class="field"><span class="k">Roles → будет</span><span class="v">${roleNames}</span></div>
-      <div class="field"><span class="k">License → будет</span><span class="v">${licenseIds}</span></div>
-      <div class="field"><span class="k">Group → будет</span><span class="v">${plan.group || '—'}</span></div>
+      <div class="field"><span class="k">Образец</span><span class="v">${esc(plan.template_name)} (${esc(plan.template_extension)})</span></div>
+      <div class="field"><span class="k">Новый пользователь</span><span class="v">${esc(plan.new_name)} (${esc(plan.new_username)})</span></div>
+      <div class="field"><span class="k">Roles → будет</span><span class="v">${esc(roleNames)}</span></div>
+      <div class="field"><span class="k">License → будет</span><span class="v">${esc(licenseIds)}</span></div>
+      <div class="field"><span class="k">Group → будет</span><span class="v">${esc(plan.group || '—')}</span></div>
       <div class="field"><span class="k">Permissions → будет</span><span class="v">${plan.copy_permissions ? permissionsText(plan.permissions, 'у образца нет прав для ролей') : 'не копируются (галочка не отмечена)'}</span></div>
-      <div class="field"><span class="k">Устройство (SIP)</span><span class="v">${plan.new_extension} — создастся вместе с пользователем</span></div>
+      <div class="field"><span class="k">Устройство (SIP)</span><span class="v">${esc(plan.new_extension)} — создастся вместе с пользователем</span></div>
       <div class="field"><span class="k">Пароль</span><span class="v">общий, сгенерируется при создании, постоянный (без принудительной смены)</span></div>
     `;
     cardEl.hidden = false;
@@ -2411,8 +2483,11 @@ document.getElementById('btnCreateExecuteSingle').addEventListener('click', asyn
   msgEl.textContent = 'Создаю...';
   try {
     const result = await api('/api/webitel/create_execute', {plan: currentCreatePlanSingle});
-    msgEl.className = 'msg info';
-    msgEl.innerHTML = `Готово. ${esc(result.name)} (${esc(result.extension)}) создан. Общий пароль: <b class="secret">${esc(result.temporary_password)}</b>${permissionsResultNote(result)}`;
+    msgEl.className = result.devices_error ? 'msg error' : 'msg info';
+    msgEl.innerHTML = `Готово. ${esc(result.name)} (${esc(result.extension)}) создан. ${createdPasswordNote(result)}${permissionsResultNote(result)}`;
+    // Done with this plan: confirming it again would only meet «уже занят».
+    currentCreatePlanSingle = null;
+    document.getElementById('createConfirmRowSingle').hidden = true;
   } catch (e) {
     msgEl.textContent = 'Ошибка: ' + e.message;
     msgEl.className = 'msg error';
@@ -2549,13 +2624,14 @@ document.getElementById('btnCreatePlan').addEventListener('click', async () => {
       const roleNames = r.plan.roles.map(x => x.name).join(', ') || '—';
       const licenseNames = r.plan.license.map(x => x.prod || x.id).join(', ') || '—';
       return `<div class="field list-ok">` +
-        `<span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v status">✓ роли: ${roleNames} · лицензии: ${licenseNames} · группа: ${r.plan.group || '—'}` +
+        `<span class="k">${esc(r.plan.new_name)} (${esc(r.plan.new_username)})</span>` +
+        `<span class="v status">✓ роли: ${esc(roleNames)} · лицензии: ${esc(licenseNames)} · группа: ${esc(r.plan.group || '—')}` +
         ` · права: ${r.plan.copy_permissions ? permissionsText(r.plan.permissions, 'у образца нет прав для ролей') : 'не копируются'}</span></div>`;
     }
-    return `<div class="field list-error"><span class="k">${r.login}</span><span class="v">${r.error}</span></div>`;
+    return `<div class="field list-error"><span class="k">${esc(r.login)}</span><span class="v">${esc(r.error)}</span></div>`;
   }).join('');
 
+  document.getElementById('btnCreateExecute').textContent = 'Подтвердить и создать все';
   if (okCount > 0) confirmRow.hidden = false;
 });
 
@@ -2568,20 +2644,27 @@ document.getElementById('btnCreateExecute').addEventListener('click', async () =
   if (!confirm(`Точно создать ${toCreate.length} пользователей? ${names}`)) return;
   btn.disabled = true;
   msgEl.className = 'msg info';
-  msgEl.textContent = 'Создаю...';
   const results = [];
-  for (const r of toCreate) {
+  const passwords = [];
+  const failed = [];
+  for (const [done, r] of toCreate.entries()) {
+    msgEl.textContent = `Создаю ${done + 1} из ${toCreate.length}...`;
+    const who = `<span class="k">${esc(r.plan.new_name)} (${esc(r.plan.new_username)})</span>`;
     try {
       const result = await api('/api/webitel/create_execute', {plan: r.plan});
-      results.push(`<div class="field ${result.permissions_error ? 'list-warn' : 'list-ok'}"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v status">✓ общий пароль: <b class="secret">${esc(result.temporary_password)}</b>${permissionsResultNote(result)}</span></div>`);
+      passwords.push({number: r.plan.new_extension, password: result.temporary_password});
+      results.push(`<div class="field ${result.permissions_error || result.devices_error ? 'list-warn' : 'list-ok'}">${who}` +
+        `<span class="v status">✓ ${createdPasswordNote(result)}${permissionsResultNote(result)}</span></div>`);
     } catch (e) {
-      results.push(`<div class="field list-error"><span class="k">${r.plan.new_name} (${r.plan.new_username})</span>` +
-        `<span class="v">${e.message}</span></div>`);
+      failed.push(r);
+      results.push(`<div class="field list-error">${who}<span class="v">${esc(e.message)}</span></div>`);
     }
   }
-  msgEl.className = 'msg info';
-  msgEl.innerHTML = 'Готово.<div class="list">' + results.join('') + '</div>';
+  // Only what didn't work out stays for another try.
+  currentCreatePlans = failed;
+  btn.textContent = `Повторить (${failed.length})`;
+  document.getElementById('createConfirmRow').hidden = failed.length === 0;
+  showResults(msgEl, results, passwords);
   btn.disabled = false;
 });
 
@@ -2781,12 +2864,36 @@ dropPlanOnChange(['groupBulkList'], () => {
 """
 
 
+# Changes with every change of the page. A tab opened before an update would
+# go on running the old page (until 2026-11-23, one a ticket could take over)
+# against the new console, so its requests are refused until it's reloaded.
+_PAGE_VERSION = hashlib.sha256(_INDEX_HTML.encode("utf-8")).hexdigest()[:16]
+_INDEX_HTML = _INDEX_HTML.replace("{{PAGE_VERSION}}", _PAGE_VERSION)
+
 _LOCAL_NOTE = "Локальный инструмент. Только на этом компьютере. Каждое реальное изменение требует отдельного подтверждения."
 _SHARED_INDEX_HTML = _INDEX_HTML.replace(
     _LOCAL_NOTE,
     "Консоль на сервере. Ваши входы в CRM и Webitel видны только в этом браузере. "
     "Каждое реальное изменение требует отдельного подтверждения.",
 )
+
+
+def _content_security_policy(html: str) -> str:
+    """Lets the browser run the page's own script (by its hash) and nothing
+    else. The page shows text anyone can write — a ticket's comment, a
+    name in Webitel — and acts with the operator's Webitel rights, so
+    markup in that text must not run even where escaping it was
+    forgotten (a ticket's comment wasn't escaped until 2026-11-23)."""
+    scripts = [
+        "'sha256-" + base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii") + "'"
+        for script in re.findall(r"<script>(.*?)</script>", html, re.S)
+    ]
+    script_src = " ".join(scripts) or "'none'"
+    return (
+        f"default-src 'none'; script-src {script_src}; "
+        "style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    )
 
 
 # What an address outside CONSOLE_ALLOWED_NETS sees instead of the console.
@@ -2867,6 +2974,7 @@ class Handler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Security-Policy", _content_security_policy(html))
         self.send_header("Content-Length", str(len(body)))
         self._send_common_headers()
         self.end_headers()
@@ -2980,6 +3088,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self._cross_site():
             self._send_json(403, {"error": "cross-site request refused"})
+            return
+        if self.headers.get("X-Console-Version") != _PAGE_VERSION:
+            self._send_json(409, {"error": "Консоль обновилась — обновите страницу (F5)", "outdated": True})
             return
 
         try:

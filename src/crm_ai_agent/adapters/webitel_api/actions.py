@@ -569,13 +569,7 @@ class WebitelApiActions:
         user, as in build_plan."""
 
         template = self.get_raw_user(template_extension)
-
-        try:
-            self.get_raw_user(new_extension)
-        except SubjectNotFoundError:
-            pass
-        else:
-            raise WebitelApiError(f"extension={new_extension!r} is already in use — refusing to create a duplicate")
+        self._refuse_taken_extension(new_extension)
 
         plan = {
             "template_extension": template_extension,
@@ -591,6 +585,13 @@ class WebitelApiActions:
             plan["copy_permissions"] = True
             plan["permissions"] = self._permissions_to_copy(template["id"])
         return plan
+
+    def _refuse_taken_extension(self, extension: str) -> None:
+        try:
+            self.get_raw_user(extension)
+        except SubjectNotFoundError:
+            return
+        raise WebitelApiError(f"номер {extension} уже занят — дубликат не создаю")
 
     def execute_create_plan(self, plan: dict[str, Any]) -> dict[str, Any]:
         """POST a brand-new user, then a matching device (real request
@@ -611,9 +612,16 @@ class WebitelApiActions:
         response's own shape (unconfirmed) to find the device id.
 
         With ``plan["copy_permissions"]`` the template's role grants go on
-        the new user last — see _grant_permissions."""
+        the new user last — see _grant_permissions.
+
+        Once the user exists, a failure with the device comes back as
+        ``devices_error`` instead of an exception: raising would lose the
+        password."""
 
         grants = self._planned_grants(plan)
+        # Re-checked here, not trusted from the plan: confirming it twice must
+        # not make a second user.
+        self._refuse_taken_extension(plan["new_extension"])
         temporary_password = generate_password()
         user_body = {
             "name": plan["new_name"],
@@ -630,17 +638,24 @@ class WebitelApiActions:
             "profile": {"group": plan["group"]} if plan.get("group") else {},
         }
         result = self._post("/api/users", user_body)
+        created = {**result, "temporary_password": temporary_password}
+        try:
+            self._create_default_device(result["id"], plan, temporary_password)
+        except WebitelApiError as exc:
+            created["devices_error"] = str(exc)
+        return self._grant_permissions(result["id"], grants, created)
 
+    def _create_default_device(self, user_id: str, plan: dict[str, Any], password: str) -> None:
         device_body = {
             "name": plan["new_extension"],
             "account": plan["new_extension"],
-            "password": temporary_password,
+            "password": password,
             "user": {
                 "name": plan["new_name"],
                 "status": "",
                 "state": True,
                 "dnd": False,
-                "id": result["id"],
+                "id": user_id,
                 "force_password_change": False,
             },
             "phone": {},
@@ -651,13 +666,11 @@ class WebitelApiActions:
         }
         self._post("/api/devices", device_body)
 
-        fresh_user = self._get(f"/api/users/{result['id']}")
+        fresh_user = self._get(f"/api/users/{user_id}")
         devices = fresh_user.get("devices") or []
         if devices:
             fresh_user["device"] = devices[0]
-            self._put(f"/api/users/{result['id']}", fresh_user)
-
-        return self._grant_permissions(result["id"], grants, {**result, "temporary_password": temporary_password})
+            self._put(f"/api/users/{user_id}", fresh_user)
 
     def find_schema(self, name: str) -> dict[str, Any] | None:
         """Read-only: the Flow schema named exactly ``name``, or None. The

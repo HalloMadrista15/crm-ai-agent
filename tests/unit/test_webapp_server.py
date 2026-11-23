@@ -41,7 +41,8 @@ class TestConsoleServer(unittest.TestCase):
     def _post(self, path: str, body: dict | None = None):
         data = json.dumps(body or {}).encode("utf-8")
         request = urllib.request.Request(
-            self._url(path), data=data, headers={"Content-Type": "application/json"}, method="POST"
+            self._url(path), data=data, method="POST",
+            headers={"Content-Type": "application/json", "X-Console-Version": server._PAGE_VERSION},
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
@@ -54,6 +55,65 @@ class TestConsoleServer(unittest.TestCase):
             self.assertEqual(response.status, 200)
             html = response.read().decode("utf-8")
             self.assertIn("Консоль оператора", html)
+
+    def test_the_browser_may_run_only_the_pages_own_script(self) -> None:
+        import base64
+        import hashlib
+
+        with urllib.request.urlopen(self._url("/"), timeout=10) as response:
+            policy, html = response.headers["Content-Security-Policy"], response.read().decode("utf-8")
+        script = html.split("<script>", 1)[1].split("</script>", 1)[0]
+        digest = base64.b64encode(hashlib.sha256(script.encode("utf-8")).digest()).decode("ascii")
+        self.assertIn(f"script-src 'sha256-{digest}';", policy)
+        self.assertNotIn("unsafe-inline", policy.split("script-src")[1].split(";")[0])
+        self.assertIn("default-src 'none'", policy)
+        # What the policy would block must not be in the page itself.
+        self.assertEqual(html.count("<script"), 1)
+        self.assertNotRegex(html, r"<[a-z][^>]* on[a-z]+=")
+        self.assertIn("script-src 'none'", server._content_security_policy(server._FORBIDDEN_HTML))
+
+    def test_nothing_from_crm_or_webitel_gets_into_the_page_unescaped(self) -> None:
+        """Every ${...} put between tags is either escaped or one of the known
+        pieces the page builds itself (which escape what they contain)."""
+        import re
+
+        built_here = re.compile(
+            r"esc\(|map\(esc\)|\? ' · ' : ''$|\.length|^label$|^who$|^text$|^missingRow$|^items$|^members$|^devices \?|^secret$|^schemaNote$|^numberWarning$"
+            r"|^statusLine$|^deviceNote$|^passwordNote$|^permissionsNote$|^isPicked|^hidden|permissionsText\(|permissionsResultNote\("
+            r"|newPasswordNote\(|createdPasswordNote\(|objectGrantsLabel\(|renderApprovals\(|grantsLabel\(|\? 'list-|^s\.is_current|^!s\.comment"
+            r"|^result\.permissions_copied$|^result\.already_deleted|^presence\.length"
+        )
+        script = server._INDEX_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
+        suspicious = [
+            (value, line.strip()[:120])
+            for line in script.splitlines() if "<" in line and ("class=" in line or "<b" in line)
+            for value in re.findall(r"\$\{([^{}]+)\}", line)
+            if not built_here.search(value)
+        ]
+        self.assertEqual(suspicious, [])
+
+    def test_a_page_from_before_an_update_is_told_to_reload(self) -> None:
+        def post(headers: dict) -> tuple:
+            request = urllib.request.Request(
+                self._url("/api/webitel/delete_execute"), data=b'{"plan": {"id": "1"}}', method="POST",
+                headers={"Content-Type": "application/json", **headers},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    return response.status, json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read())
+
+        with mock.patch.object(server, "_get_webitel_actions") as actions:
+            for headers in ({}, {"X-Console-Version": "0123456789abcdef"}):  # before versions existed; another version
+                status, payload = post(headers)
+                self.assertEqual((status, payload["outdated"]), (409, True), headers)
+                self.assertIn("обновите страницу", payload["error"])
+            actions.assert_not_called()
+        with urllib.request.urlopen(self._url("/"), timeout=10) as response:
+            html = response.read().decode("utf-8")
+        self.assertIn(f"const PAGE_VERSION = '{server._PAGE_VERSION}';", html)
+        self.assertNotIn("{{", html)
 
     def test_unknown_get_path_is_404(self) -> None:
         with self.assertRaises(urllib.error.HTTPError) as ctx:
@@ -431,7 +491,10 @@ class TestSharedConsole(unittest.TestCase):
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}{path}",
             data=json.dumps(body or {}).encode("utf-8"),
-            headers={"Content-Type": "application/json", **({"Cookie": cookie} if cookie else {}), **(headers or {})},
+            headers={
+                "Content-Type": "application/json", "X-Console-Version": server._PAGE_VERSION,
+                **({"Cookie": cookie} if cookie else {}), **(headers or {}),
+            },
             method="POST",
         )
         try:

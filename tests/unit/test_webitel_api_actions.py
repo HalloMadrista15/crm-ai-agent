@@ -575,6 +575,7 @@ class TestCreateWithPermissions(unittest.TestCase):
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_new_user_gets_the_planned_permissions_last(self, mock_urlopen) -> None:
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "5555"}),  # POST /api/users
             _FakeResponse({"id": "device-1"}),  # POST /api/devices
             _FakeResponse({"id": "5555"}),  # GET refetch, no devices -> no PUT
@@ -598,6 +599,7 @@ class TestCreateWithPermissions(unittest.TestCase):
             {"grantee": "6143", "name": "user-alm-aic-301", "granted": "r", "current": ""},
         ]}
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "5555"}), _FakeResponse({"id": "device-1"}), _FakeResponse({"id": "5555"}),
             _acl(_grant("2401", "semiadmin", "rw")),  # Webitel's default
             _FakeResponse({}),
@@ -613,6 +615,7 @@ class TestCreateWithPermissions(unittest.TestCase):
         import urllib.error
 
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "5555"}),
             _FakeResponse({"id": "device-1"}),
             _FakeResponse({"id": "5555"}),
@@ -626,9 +629,9 @@ class TestCreateWithPermissions(unittest.TestCase):
 
     @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
     def test_without_the_checkbox_no_patch(self, mock_urlopen) -> None:
-        mock_urlopen.side_effect = [_FakeResponse({"id": "5555"}), _FakeResponse({"id": "device-1"}), _FakeResponse({"id": "5555"})]
+        mock_urlopen.side_effect = [_FakeResponse({"items": []}), _FakeResponse({"id": "5555"}), _FakeResponse({"id": "device-1"}), _FakeResponse({"id": "5555"})]
         result = _actions().execute_create_plan({**self.PLAN, "copy_permissions": False})
-        self.assertEqual(mock_urlopen.call_count, 3)
+        self.assertEqual(mock_urlopen.call_count, 4)
         self.assertNotIn("permissions_copied", result)
 
 
@@ -644,6 +647,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
             "group": "7719499780",
         }
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "5555", "status": "ok"}),  # POST /api/users
             _FakeResponse({"id": "device-1"}),  # POST /api/devices
             _FakeResponse({"id": "5555"}),  # GET refetch (no "devices" key -> no default-device PUT)
@@ -651,7 +655,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
 
         result = _actions().execute_create_plan(plan)
 
-        post_request = mock_urlopen.call_args_list[0].args[0]
+        post_request = mock_urlopen.call_args_list[1].args[0]
         self.assertEqual(post_request.get_method(), "POST")
         sent_body = json.loads(post_request.data)
 
@@ -687,6 +691,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
             "group": "",
         }
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "5555", "status": "ok"}),
             _FakeResponse({"id": "device-1"}),
             _FakeResponse({"id": "5555"}),  # GET refetch (no "devices" key -> no default-device PUT)
@@ -694,7 +699,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
 
         result = _actions().execute_create_plan(plan)
 
-        device_request = mock_urlopen.call_args_list[1].args[0]
+        device_request = mock_urlopen.call_args_list[2].args[0]
         self.assertEqual(device_request.get_method(), "POST")
         self.assertIn("/api/devices", device_request.full_url)
         device_body = json.loads(device_request.data)
@@ -716,6 +721,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
 
         plan = {"new_username": "10087", "new_name": "New Person", "new_extension": "10087", "roles": [], "license": [], "group": ""}
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "5555"}),  # POST /api/users
             _FakeResponse({"id": "device-1"}),  # POST /api/devices
             _FakeResponse({"id": "5555", "name": "New Person", "devices": [{"id": "150444", "name": "10087"}]}),  # GET refetch
@@ -724,7 +730,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
 
         _actions().execute_create_plan(plan)
 
-        put_request = mock_urlopen.call_args_list[3].args[0]
+        put_request = mock_urlopen.call_args_list[4].args[0]
         self.assertEqual(put_request.get_method(), "PUT")
         self.assertIn("/api/users/5555", put_request.full_url)
         sent_body = json.loads(put_request.data)
@@ -736,9 +742,11 @@ class TestExecuteCreatePlan(unittest.TestCase):
     def test_each_call_generates_a_different_password(self, mock_urlopen) -> None:
         plan = {"new_username": "a", "new_name": "A", "new_extension": "1", "roles": [], "license": [], "group": ""}
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "1"}),
             _FakeResponse({}),
             _FakeResponse({"id": "1"}),  # GET refetch, no devices
+            _FakeResponse({"items": []}),  # the number is free
             _FakeResponse({"id": "2"}),
             _FakeResponse({}),
             _FakeResponse({"id": "2"}),  # GET refetch, no devices
@@ -755,6 +763,7 @@ class TestExecuteCreatePlan(unittest.TestCase):
 
         plan = {"new_username": "a", "new_name": "A", "new_extension": "1", "roles": [], "license": [], "group": ""}
         mock_urlopen.side_effect = [
+            _FakeResponse({"items": []}),  # the number is free
             urllib.error.HTTPError(
                 url="https://wtl-alm.astana-motors.kz/api/users",
                 code=409,
@@ -765,6 +774,27 @@ class TestExecuteCreatePlan(unittest.TestCase):
         ]
         with self.assertRaises(WebitelApiError):
             _actions().execute_create_plan(plan)
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_confirmed_twice_makes_one_user(self, mock_urlopen) -> None:
+        plan = {"new_username": "10087", "new_name": "New Person", "new_extension": "10087", "roles": [], "license": [], "group": ""}
+        mock_urlopen.side_effect = [
+            _FakeResponse({"items": [{"id": "5555", "extension": "10087"}]}), _FakeResponse({"id": "5555", "extension": "10087"}),
+        ]
+        with self.assertRaises(WebitelApiError) as ctx:
+            _actions().execute_create_plan(plan)
+        self.assertIn("уже занят", str(ctx.exception))
+        for call in mock_urlopen.call_args_list:
+            self.assertEqual(call.args[0].get_method(), "GET")
+
+    @patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen")
+    def test_a_device_that_could_not_be_made_keeps_the_password(self, mock_urlopen) -> None:
+        plan = {"new_username": "10087", "new_name": "New Person", "new_extension": "10087", "roles": [], "license": [], "group": ""}
+        for failure in (_http_error(502, "{}"), _no_answer()):
+            mock_urlopen.side_effect = [_FakeResponse({"items": []}), _FakeResponse({"id": "5555", "name": "New Person"}), failure]
+            result = _actions().execute_create_plan(plan)
+            self.assertRegex(result["temporary_password"], _PASSWORD_FORMAT)
+            self.assertIn("/api/devices", result["devices_error"])
 
 
 class TestBuildDeletePlan(unittest.TestCase):
