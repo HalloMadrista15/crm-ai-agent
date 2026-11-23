@@ -81,7 +81,7 @@ class TestConsoleServer(unittest.TestCase):
             r"esc\(|map\(esc\)|\? ' · ' : ''$|\.length|^label$|^who$|^text$|^missingRow$|^items$|^members$|^devices \?|^secret$|^schemaNote$|^numberWarning$"
             r"|^statusLine$|^deviceNote$|^passwordNote$|^permissionsNote$|^isPicked|^hidden|permissionsText\(|permissionsResultNote\("
             r"|newPasswordNote\(|createdPasswordNote\(|objectGrantsLabel\(|renderApprovals\(|grantsLabel\(|\? 'list-|^s\.is_current|^!s\.comment"
-            r"|^result\.permissions_copied$|^result\.already_deleted|^presence\.length"
+            r"|^tone$|^result\.permissions_copied$|^result\.already_deleted|^presence\.length"
         )
         script = server._INDEX_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
         suspicious = [
@@ -593,6 +593,62 @@ class TestSharedConsole(unittest.TestCase):
     def test_the_key_never_shows_up_when_an_operator_is_printed(self) -> None:
         op = server._named_operator("ws", b"0123456789abcdef0123456789abcdef")
         self.assertNotIn("0123456789abcdef", repr(op))
+
+    def _write_log(self, *entries: dict) -> None:
+        lines = [json.dumps({"time": "2026-11-23T05:00:00+00:00", "workspace": "abcdef12", "ip": "10.80.0.110", "ok": True, **e})
+                 for e in entries]
+        (self.root / "audit.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _journal(self, query: str = "", offset: int = 0, session: str = "active", cookie: str = ""):
+        with mock.patch.object(server, "_webitel_session_state", return_value={"session": session}):
+            return self._post("/api/journal", {"query": query, "offset": offset}, cookie=cookie or self._new_browser())
+
+    def test_the_journal_tells_who_did_what_newest_first(self) -> None:
+        self._write_log(
+            {"action": "/api/webitel/create_execute", "city": "almaty", "crm_login": "", "webitel_login": "10075@mycar-almaty.astana-motors.kz",
+             "new_extension": "30121", "new_name": "Test", "template_extension": "30119"},
+            {"action": "/api/webitel/execute", "city": "astana", "crm_login": "m.muratbay", "webitel_login": "10078", "target_extension": "30120",
+             "target_name": "TEST1", "template_extension": "30119", "reset_password": True, "devices_error": "30120: HTTP 400"},
+            {"action": "/api/webitel/delete_execute", "city": "almaty", "extension": "30121", "name": "Test", "ok": False, "error": "HTTP 502"},
+            {"action": "/api/webitel/group_execute", "city": "almaty", "crm_login": "m.muratbay", "webitel_login": "m.muratbay", "number": "30201",
+             "name": "team-AST", "members": [{"extension": "30202", "name": "x"}, {"extension": "30203", "name": "y"}]},
+        )
+        status, data = self._journal()
+        self.assertEqual((status, data["total"]), (200, 4))
+        group, deleted, copied, created = data["entries"]
+        self.assertEqual((created["kind"], created["number"], created["name"], created["who"], created["city"]),
+                         ("Создание", "30121", "Test", "10075", "Алматы"))
+        self.assertEqual((copied["who"], copied["details"], copied["problem"], copied["ok"]),
+                         ("m.muratbay · 10078", "образец 30119 · сброс пароля", "устройство: 30120: HTTP 400", True))
+        self.assertEqual((deleted["ok"], deleted["problem"], deleted["who"]), (False, "HTTP 502", "10.80.0.110"))
+        self.assertEqual((group["who"], group["details"]), ("m.muratbay", "участники 30202, 30203"))
+        self.assertNotIn("abcdef12", json.dumps(data))  # whose browser it was stays in the file
+
+    def test_the_journal_is_searched_by_number_name_or_who(self) -> None:
+        self._write_log(
+            {"action": "/api/webitel/create_execute", "city": "almaty", "crm_login": "da.popov", "new_extension": "30121", "new_name": "Иван Иванов"},
+            {"action": "/api/webitel/delete_execute", "city": "astana", "crm_login": "m.muratbay", "extension": "28071", "name": "Пётр"},
+        )
+        for query, numbers in (("30121", ["30121"]), ("ИВАНОВ", ["30121"]), ("muratbay", ["28071"]), ("удаление астана", ["28071"]),
+                               ("da.popov 28071", []), ("110", []), ("", ["28071", "30121"])):
+            self.assertEqual([e["number"] for e in self._journal(query)[1]["entries"]], numbers, query)
+
+    def test_the_journal_comes_in_pages_and_survives_a_broken_line(self) -> None:
+        self._write_log(*[{"action": "/api/webitel/password_execute", "extension": str(10000 + n)} for n in range(150)])
+        with (self.root / "audit.jsonl").open("a", encoding="utf-8") as log:
+            log.write('{"time": "2026-11-23T05:\n[]\n\n')
+        first, rest = self._journal()[1], self._journal(offset=100)[1]
+        self.assertEqual((first["total"], len(first["entries"]), len(rest["entries"])), (150, 100, 50))
+        self.assertEqual((first["entries"][0]["number"], rest["entries"][-1]["number"]), ("10149", "10000"))
+        self.assertEqual(len(self._journal(offset=-5)[1]["entries"]), 100)
+        (self.root / "audit.jsonl").unlink()
+        self.assertEqual(self._journal()[1], {"entries": [], "total": 0})
+
+    def test_the_journal_needs_a_webitel_login(self) -> None:
+        self._write_log({"action": "/api/webitel/create_execute", "new_extension": "30121", "new_name": "Иван Иванов"})
+        for session in ("missing", "expired", "error"):
+            status, data = self._journal(session=session)
+            self.assertEqual((status, list(data)), (403, ["error"]), session)
 
     def test_an_address_outside_the_allowed_nets_gets_nothing(self) -> None:
         with mock.patch.object(server, "_ip_allowed", return_value=False):

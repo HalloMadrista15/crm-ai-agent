@@ -521,6 +521,82 @@ def _audit(op: _Operator, client_ip: str, action: str, details: dict[str, Any]) 
             log.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+# What the journal calls a change, by the endpoint that made it.
+_JOURNAL_KINDS = {
+    "execute": "Копирование",
+    "create_execute": "Создание",
+    "delete_execute": "Удаление",
+    "password_execute": "Сброс пароля",
+    "group_execute": "Группа",
+    "role_execute": "Роль",
+}
+_JOURNAL_PROBLEMS = {"permissions_error": "права", "route_error": "маршрут", "devices_error": "устройство", "objects_error": "Objects"}
+_JOURNAL_PAGE = 100
+
+
+def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """One line of the audit log as the journal shows it. ``who`` is only
+    what was recorded: the CRM and Webitel logins the browser worked
+    under, or its address when it had neither."""
+
+    def first(*keys: str) -> str:
+        return next((str(entry[key]) for key in keys if entry.get(key)), "")
+
+    kind = str(entry.get("action", "")).rsplit("/", 1)[-1]
+    details = []
+    if entry.get("template_extension"):
+        details.append(f"образец {entry['template_extension']}")
+    if entry.get("reset_password"):
+        details.append("сброс пароля")
+    if entry.get("copy_permissions"):
+        details.append("Permissions")
+    if entry.get("members"):
+        details.append("участники " + ", ".join(str(m.get("extension", "")) for m in entry["members"]))
+    if entry.get("fallback"):
+        details.append(f"если не ответили — {entry['fallback']}")
+    problems = [f"{label}: {entry[key]}" for key, label in _JOURNAL_PROBLEMS.items() if entry.get(key)]
+    if entry.get("error"):
+        problems.append(str(entry["error"]))
+    logins = [first(key).split("@")[0] for key in ("crm_login", "webitel_login")]
+    return {
+        "time": first("time"),
+        "city": _CITY_NAMES.get(first("city"), first("city")),
+        "kind": _JOURNAL_KINDS.get(kind, kind),
+        "number": first("target_extension", "new_extension", "extension", "number"),
+        "name": first("target_name", "new_name", "name"),
+        "details": " · ".join(details),
+        "who": " · ".join(dict.fromkeys(login for login in logins if login)) or first("ip"),
+        "ok": entry.get("ok") is True,
+        "problem": "; ".join(problems),
+    }
+
+
+def _read_journal(query: str, offset: int) -> dict[str, Any]:
+    """The audit log, newest first; every word of ``query`` has to be
+    somewhere in what an entry shows."""
+    with _audit_lock:
+        lines = AUDIT_LOG_PATH.read_text(encoding="utf-8-sig").splitlines() if AUDIT_LOG_PATH.exists() else []
+    words = query.lower().split()
+    found = []
+    for line in reversed(lines):
+        try:
+            shown = _journal_entry(json.loads(line))
+        except (ValueError, AttributeError, TypeError):
+            continue  # a line cut short by a crash must not hide the rest
+        text = " ".join(shown[key] for key in ("kind", "city", "number", "name", "details", "who")).lower()
+        if all(word in text for word in words):
+            found.append(shown)
+    return {"entries": found[offset:offset + _JOURNAL_PAGE], "total": len(found)}
+
+
+def _may_read_journal(op: _Operator) -> bool:
+    """Colleagues' names and numbers: on a shared console only for a browser
+    that is logged in to Webitel through it."""
+    return not _SHARED or any(
+        _webitel_session_state(op, city)["session"] == "active" for city in WEBITEL_STORAGE_STATE_PATHS
+    )
+
+
 _INDEX_HTML = """<!doctype html>
 <html lang="ru">
 <head>
@@ -552,7 +628,9 @@ _INDEX_HTML = """<!doctype html>
 
   /* Left rail: the sections, as icons with a short label. */
   .rail{position:fixed;inset:0 auto 0 0;width:var(--rail-w);z-index:20;display:flex;flex-direction:column;align-items:center;gap:6px;padding:18px 0 16px;background:var(--rail);border-right:1px solid var(--border);}
-  .rail-logo{width:40px;height:40px;display:grid;place-items:center;color:var(--amber);margin-bottom:14px;filter:drop-shadow(0 0 10px rgba(245,170,61,.35));}
+  .rail{overflow-y:auto;scrollbar-width:none;}
+  .rail::-webkit-scrollbar{display:none;}
+  .rail-logo{width:40px;height:40px;flex-shrink:0;display:grid;place-items:center;color:var(--amber);margin-bottom:14px;filter:drop-shadow(0 0 10px rgba(245,170,61,.35));}
   .rail-links{display:flex;flex-direction:column;align-items:center;gap:4px;}
   .nav-link,.nav-account-btn{display:flex;flex-direction:column;align-items:center;gap:4px;width:76px;padding:6px 0;background:transparent;border:none;border-radius:14px;color:var(--text-faint);font-size:10.5px;font-weight:500;letter-spacing:.01em;}
   .rail-icon{position:relative;display:grid;place-items:center;width:42px;height:42px;border-radius:50%;background:var(--surface);border:1px solid var(--border);color:var(--text-soft);transition:background-color .15s,color .15s,border-color .15s,box-shadow .15s;}
@@ -741,6 +819,23 @@ _INDEX_HTML = """<!doctype html>
     .steps.cols-2{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1fr);align-items:start;}
   }
 
+  .list .field.journal{display:grid;grid-template-columns:104px minmax(0,1fr) minmax(0,auto);gap:4px 16px;align-items:baseline;}
+  .journal-when{color:var(--text-soft);font-variant-numeric:tabular-nums;white-space:nowrap;}
+  .journal-what{min-width:0;overflow-wrap:anywhere;}
+  .journal-what b{font-weight:600;margin-right:4px;}
+  .journal-note{display:block;font-size:12px;color:var(--text-soft);}
+  .journal-who{color:var(--text-soft);text-align:right;overflow-wrap:anywhere;}
+  .journal-more{margin-top:14px;}
+
+  /* Low windows: everything in the rail has to fit. */
+  @media (max-height:800px) and (min-width:761px){
+    .rail{padding:10px 0;gap:2px;}
+    .rail-logo{width:32px;height:32px;margin-bottom:4px;}
+    .rail-links{gap:0;}
+    .nav-link,.nav-account-btn{padding:4px 0;gap:3px;}
+    .rail-icon{width:36px;height:36px;}
+  }
+
   /* Phones and narrow windows: the rail becomes a scrolling bar on top. */
   @media (max-width:760px){
     .rail{position:sticky;top:0;inset:auto;width:auto;height:auto;flex-direction:row;padding:8px 10px;gap:4px;overflow-x:auto;scrollbar-width:none;border-right:none;border-bottom:1px solid var(--border);}
@@ -754,6 +849,8 @@ _INDEX_HTML = """<!doctype html>
     .topbar{position:static;flex-wrap:wrap;padding-top:12px;padding-bottom:4px;}
     .topbar-brand{display:none;}
     .page-head h1{font-size:25px;}
+    .list .field.journal{grid-template-columns:minmax(0,1fr) auto;}
+    .journal-what{grid-column:1 / -1;grid-row:2;}
     .card{padding:18px 16px;border-radius:16px;}
     .field-group:not(.narrow){flex:1 1 100%;min-width:0;}
     .row > button{flex:1 1 auto;}
@@ -780,6 +877,7 @@ _INDEX_HTML = """<!doctype html>
     <button type="button" class="nav-link" data-section="groups" data-title="Групповой номер" title="Группы"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="rail-label">Группы</span></button>
     <button type="button" class="nav-link" data-section="password" data-title="Сброс пароля" title="Пароль"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg></span><span class="rail-label">Пароль</span></button>
     <button type="button" class="nav-link" data-section="roles" data-title="Роль Webitel" title="Роли"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span><span class="rail-label">Роли</span></button>
+    <button type="button" class="nav-link" data-section="journal" data-title="Журнал" title="Журнал"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></span><span class="rail-label">Журнал</span></button>
   </nav>
   <button type="button" class="nav-account-btn" data-section="account" data-title="Вход и настройки" title="Вход и настройки"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg><span class="status-dot" id="navLoginDot" title="CRM: не выполнен вход"></span></span><span class="rail-label">Вход</span></button>
 </aside>
@@ -1318,6 +1416,29 @@ _INDEX_HTML = """<!doctype html>
   </div>
   </section>
 
+  <section class="app-section" data-section-panel="journal" hidden>
+  <div class="steps">
+
+  <div class="card">
+    <div class="card-head"><h2>Что сделано в Webitel через консоль</h2></div>
+    <div class="card-body">
+      <div class="row">
+        <div class="field-group">
+          <input type="text" id="journalQuery" placeholder="номер, имя или кто" aria-label="Поиск по журналу">
+        </div>
+        <button id="btnJournal">Найти</button>
+      </div>
+      <div id="journalMsg" class="msg info"></div>
+      <div id="journalList" class="list"></div>
+      <div class="row journal-more" id="journalMoreRow" hidden>
+        <button type="button" id="btnJournalMore" class="ghost">Показать ещё</button>
+      </div>
+    </div>
+  </div>
+
+  </div>
+  </section>
+
 </div>
 </main>
 
@@ -1356,6 +1477,7 @@ navButtons.forEach(btn => {
     });
     document.getElementById('cityPicker').hidden = !CITY_PICKER_SECTIONS.includes(target);
     document.getElementById('pageTitle').textContent = btn.dataset.title;
+    if (target === 'journal') loadJournal(0);
   });
 });
 
@@ -2356,6 +2478,50 @@ document.getElementById('btnPasswordExecute').addEventListener('click', async ()
   btn.disabled = false;
 });
 
+// «Журнал»: the console's own log of what was changed, newest first.
+let journalShown = 0;
+let journalRequest = 0;
+
+function journalRow(e) {
+  const when = new Date(e.time).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit'});
+  const tone = e.ok ? (e.problem ? ' list-warn' : '') : ' list-error';
+  const what = [e.number, e.name].filter(Boolean).join(' — ');
+  const note = [e.city, e.details, e.problem].filter(Boolean).join(' · ');
+  return `<div class="field journal${tone}"><span class="journal-when">${esc(when)}</span>` +
+    `<span class="journal-what"><b>${esc(e.kind)}</b> ${esc(what)}<span class="journal-note">${esc(note)}</span></span>` +
+    `<span class="journal-who">${esc(e.who)}</span></div>`;
+}
+
+async function loadJournal(offset) {
+  const msgEl = document.getElementById('journalMsg');
+  const listEl = document.getElementById('journalList');
+  const moreRow = document.getElementById('journalMoreRow');
+  const request = ++journalRequest;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Читаю журнал...';
+  try {
+    const data = await api('/api/journal', {query: document.getElementById('journalQuery').value, offset});
+    if (request !== journalRequest) return;  // a newer search is already on its way
+    if (offset === 0) listEl.innerHTML = '';
+    listEl.insertAdjacentHTML('beforeend', data.entries.map(journalRow).join(''));
+    journalShown = offset + data.entries.length;
+    msgEl.textContent = data.total ? `Записей: ${data.total}` : 'Ничего не найдено';
+    moreRow.hidden = journalShown >= data.total;
+  } catch (e) {
+    if (request !== journalRequest) return;
+    if (offset === 0) listEl.innerHTML = '';
+    moreRow.hidden = true;
+    msgEl.className = 'msg error';
+    msgEl.textContent = e.message;
+  }
+}
+
+document.getElementById('btnJournal').addEventListener('click', () => loadJournal(0));
+document.getElementById('btnJournalMore').addEventListener('click', () => loadJournal(journalShown));
+document.getElementById('journalQuery').addEventListener('keydown', event => {
+  if (event.key === 'Enter') loadJournal(0);
+});
+
 let currentRolePlan = null;
 
 // Letters on Permissions → Objects, as its columns name them.
@@ -3205,6 +3371,16 @@ class Handler(BaseHTTPRequestHandler):
                 comments = [ticket.get("comment") or ""] + [step["comment"] for step in steps]
                 ticket["webitel_logins"] = _extract_webitel_logins("\n".join(comments))
                 self._send_json(200, ticket)
+                return
+
+            if self.path == "/api/journal":
+                if not _may_read_journal(op):
+                    self._send_json(403, {"error": "Журнал виден после входа в Webitel"})
+                    return
+                offset = body.get("offset")
+                if not isinstance(offset, int) or offset < 0:
+                    offset = 0
+                self._send_json(200, _read_journal(str(body.get("query") or ""), offset))
                 return
 
             if self.path == "/api/webitel/session_status":
