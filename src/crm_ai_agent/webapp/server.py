@@ -789,6 +789,8 @@ _INDEX_HTML = """<!doctype html>
   .chip .status-dot{margin:0;}
   .chip:hover{background:var(--surface-2);color:var(--text);border-color:var(--border-strong);}
   .topbar-brand{font-family:var(--font-display);font-size:13.5px;font-weight:600;color:var(--text-soft);letter-spacing:-.01em;white-space:nowrap;}
+  .topbar-user{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--text-soft);white-space:nowrap;}
+  .topbar-user[hidden]{display:none;}
   .page{max-width:var(--page-max);margin:0 auto;padding:10px var(--gutter) 0;box-sizing:content-box;}
   .page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px 24px;flex-wrap:wrap;margin-bottom:22px;}
   .page-head h1{font-family:var(--font-display);font-size:32px;font-weight:650;letter-spacing:-.035em;line-height:1.15;margin:0 0 6px;color:var(--text);}
@@ -1034,7 +1036,8 @@ _INDEX_HTML = """<!doctype html>
     <button type="button" class="chip" data-chip="almaty"><span class="status-dot"></span>Алматы <b>проверяю...</b></button>
     <button type="button" class="chip" data-chip="astana"><span class="status-dot"></span>Астана <b>проверяю...</b></button>
   </div>
-  <span class="topbar-brand">Консоль оператора</span>
+  <span class="topbar-brand" id="topbarBrand">Консоль оператора</span>
+  <span class="topbar-user" id="topbarUser" hidden><span id="accessMe"></span><button type="button" class="ghost" id="btnAdLogout">Выйти</button></span>
 </header>
 <div class="page">
   <div id="outdatedBanner" class="code-banner" hidden>Консоль обновилась. <button type="button" id="btnReload">Обновить страницу</button></div>
@@ -1077,21 +1080,15 @@ _INDEX_HTML = """<!doctype html>
   <div class="card" id="accessCard" hidden>
     <div class="card-head"><h2>Доступ в консоль</h2></div>
     <div class="card-body">
-      <div class="saved-login">
-        <span class="saved-login-text">Вы вошли как <b id="accessMe"></b></span>
-        <span class="saved-login-actions"><button type="button" class="ghost" id="btnAdLogout">Выйти</button></span>
-      </div>
-      <div id="accessAdmin" hidden>
-        <div class="row">
-          <div class="field-group">
-            <label class="field-label" for="accessLogin">Логин AD</label>
-            <input type="text" id="accessLogin" placeholder="напр. i.ivanov" autocomplete="off" spellcheck="false">
-          </div>
-          <button type="button" id="btnAccessGrant">Добавить</button>
+      <div class="row">
+        <div class="field-group">
+          <label class="field-label" for="accessLogin">Логин AD</label>
+          <input type="text" id="accessLogin" placeholder="напр. i.ivanov" autocomplete="off" spellcheck="false">
         </div>
-        <div id="accessMsg" class="msg info"></div>
-        <div id="accessList" class="list"></div>
+        <button type="button" id="btnAccessGrant">Добавить</button>
       </div>
+      <div id="accessMsg" class="msg info"></div>
+      <div id="accessList" class="list"></div>
     </div>
   </div>
   </div>
@@ -2743,7 +2740,7 @@ document.getElementById('journalQuery').addEventListener('keydown', event => {
   if (event.key === 'Enter') loadJournal(0);
 });
 
-// «Доступ в консоль»: who is signed in and, for an admin, who may sign in.
+// Who is signed in (top right) and, for an admin, who may («Доступ в консоль»).
 function accessRow(user, me) {
   const role = user.admin
     ? '<span class="pill neutral">админ</span>'
@@ -2756,9 +2753,10 @@ function accessRow(user, me) {
 }
 
 function showAccess(data) {
-  document.getElementById('accessCard').hidden = !data.me;
+  document.getElementById('topbarBrand').hidden = !!data.me;
+  document.getElementById('topbarUser').hidden = !data.me;
   document.getElementById('accessMe').textContent = data.me;
-  document.getElementById('accessAdmin').hidden = !data.users;
+  document.getElementById('accessCard').hidden = !data.users;
   document.getElementById('accessList').innerHTML = (data.users || []).map(user => accessRow(user, data.me)).join('');
 }
 
