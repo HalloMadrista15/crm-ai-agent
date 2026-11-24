@@ -81,7 +81,7 @@ class TestConsoleServer(unittest.TestCase):
             r"esc\(|map\(esc\)|\? ' · ' : ''$|\.length|^label$|^who$|^text$|^missingRow$|^items$|^members$|^devices \?|^secret$|^schemaNote$|^numberWarning$"
             r"|^statusLine$|^deviceNote$|^passwordNote$|^permissionsNote$|^isPicked|^hidden|permissionsText\(|permissionsResultNote\("
             r"|newPasswordNote\(|createdPasswordNote\(|objectGrantsLabel\(|renderApprovals\(|grantsLabel\(|\? 'list-|^s\.is_current|^!s\.comment"
-            r"|^tone$|^result\.permissions_copied$|^result\.already_deleted|^presence\.length"
+            r"|^tone$|^role$|^remove$|^result\.permissions_copied$|^result\.already_deleted|^presence\.length"
         )
         script = server._INDEX_HTML.split("<script>", 1)[1].split("</script>", 1)[0]
         suspicious = [

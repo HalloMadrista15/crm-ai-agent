@@ -21,7 +21,8 @@ server instead (2026-10-07): it looks and works the same, but every
 browser gets its own workspace (a cookie) with its own CRM browser, saved
 logins and Webitel sessions under operators/<id>/, so colleagues never act
 under each other's accounts. run() refuses to listen beyond loopback
-unless the console is shared and served over HTTPS.
+unless the console is shared and served over HTTPS. CONSOLE_AD_DOMAIN
+makes it ask for an AD sign-in first (webapp/console_access.py).
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
+from crm_ai_agent.webapp import console_access
 from crm_ai_agent.webapp.crm_session import CrmSessionExpired, CrmSessionManager
 from crm_ai_agent.webapp.webitel_login import WEBITEL_CITY_KEYS, WebitelLoginJob, city_config, latest_screenshot
 
@@ -59,6 +61,8 @@ WEBITEL_STORAGE_STATE_PATHS = {
 # Shared console only: each operator's own logins and Webitel sessions.
 OPERATORS_DIR = ROOT / "operators"
 AUDIT_LOG_PATH = ROOT / "audit" / "console_actions.jsonl"
+# Who signed in to the console, and who tried to.
+AD_LOG_PATH = ROOT / "audit" / "ad_logins.jsonl"
 
 
 _SETTINGS_KEYS = (
@@ -417,9 +421,10 @@ def _resolve_crm_login(body: dict[str, Any], op: _Operator | None = None) -> tup
 
 # --- Shared console: a workspace per browser, and who changed what ---
 #
-# No sign-in to the console itself: every browser gets its own workspace (a
-# cookie), and inside it logs in to CRM and Webitel exactly as on a local
-# console. Workspaces never see each other's logins, sessions or CRM browser.
+# Every browser gets its own workspace (a cookie), and inside it logs in to
+# CRM and Webitel exactly as on a local console. Workspaces never see each
+# other's logins, sessions or CRM browser. With CONSOLE_AD_DOMAIN the console
+# asks who it is first, and a workspace belongs to one AD account.
 
 _WORKSPACE_COOKIE = "console_workspace"
 _WORKSPACE_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
@@ -457,6 +462,129 @@ def _ip_allowed(ip: str, nets: list[ipaddress.IPv4Network | ipaddress.IPv6Networ
     except ValueError:
         return False
     return address.is_loopback or any(address in net for net in nets)
+
+
+# --- Sign-in with AD: only the accounts in CONSOLE_AD_ADMINS and
+# CONSOLE_AD_USERS; the admins change both lists in the console.
+
+_AD_COOKIE = "console_ad"
+# Set by run() from CONSOLE_AD_DOMAIN ("" = no sign-in). Not read again later:
+# info.env damaged while the console runs lets nobody in, not everybody.
+_AD_DOMAIN = ""
+_sign_ins = console_access.SignIns(ROOT / ".auth" / "console_sign_ins.json")
+_ad_throttle = console_access.Throttle()
+_ad_address_throttle = console_access.Throttle(limit=10)
+# One attempt at a time: ten sent at once don't get past the limit of four.
+_ad_lock = threading.Lock()
+
+
+def _ad_people(strict: bool = False) -> tuple[list[str], list[str]]:
+    """(admins, those they let in), read anew every time, so an edit of
+    info.env works at once. A list with a typo in it lets nobody in —
+    with ``strict`` it raises instead."""
+    env = _load_env_file(INFO_ENV_PATH)
+    lists = []
+    for key in ("CONSOLE_AD_ADMINS", "CONSOLE_AD_USERS"):
+        try:
+            lists.append(console_access.parse_logins(env.get(key, ""), _AD_DOMAIN))
+        except ValueError as exc:
+            if strict:
+                raise ValueError(f"{key} в info.env: {exc}") from exc
+            lists.append([])
+    return lists[0], lists[1]
+
+
+def _ad_problem(env: dict[str, str], shared: bool) -> str:
+    """Why the console can't start with these CONSOLE_AD_* settings, or ""."""
+    domain = env.get("CONSOLE_AD_DOMAIN", "").strip()
+    if not domain:
+        if env.get("CONSOLE_AD_ADMINS") or env.get("CONSOLE_AD_USERS"):
+            return "список CONSOLE_AD_... есть, а CONSOLE_AD_DOMAIN пуст — консоль открылась бы всем"
+        return ""
+    if not shared:
+        return "CONSOLE_AD_DOMAIN работает только с CONSOLE_SHARED=1"
+    for key in ("CONSOLE_AD_ADMINS", "CONSOLE_AD_USERS"):
+        try:
+            console_access.parse_logins(env.get(key, ""), domain)
+        except ValueError as exc:
+            return f"{key}: {exc}"
+    if not console_access.parse_logins(env.get("CONSOLE_AD_ADMINS", ""), domain):
+        return "CONSOLE_AD_ADMINS пуст — некому управлять доступом"
+    return console_access.check_problem()
+
+
+def _access_info(login: str) -> dict[str, Any]:
+    """What «Доступ в консоль» shows: who is signed in and, to an admin,
+    everyone who may."""
+    if not _AD_DOMAIN:
+        return {"me": ""}
+    admins, users = _ad_people()
+    if login not in admins:
+        return {"me": login}
+    everyone = [*admins, *(user for user in users if user not in admins)]
+    return {"me": login, "users": [
+        {"login": user, "name": console_access.account_name(user, _AD_DOMAIN) or "", "admin": user in admins}
+        for user in everyone
+    ]}
+
+
+def _change_access(by: str, action: str, raw: str) -> tuple[str, str]:
+    """An admin lets an account in ("grant"), no longer ("revoke") or makes it
+    an admin ("promote"); (login, the person's name). Takes effect at once.
+    ValueError says what is wrong. Nobody removes themselves, so there is
+    always an admin left."""
+    login = console_access.normalize_login(raw, _AD_DOMAIN)
+    if not login:
+        raise ValueError("Укажите логин AD, например i.ivanov")
+    name = console_access.account_name(login, _AD_DOMAIN)
+    with _env_lock:
+        admins, users = _ad_people(strict=True)
+        if by not in admins:  # asked here, not before: two admins may be removing each other
+            raise PermissionError("Доступом управляют админы консоли")
+        if action == "grant":
+            if login in admins or login in users:
+                raise ValueError(f"У {login} доступ уже есть")
+            if name is None:
+                raise ValueError(f"В AD нет логина {login}")
+            users.append(login)
+        else:
+            if login not in admins and login not in users:
+                raise ValueError(f"{login} нет в списке")
+            if action == "promote" and login in admins:
+                raise ValueError(f"{login} уже админ")
+            if action == "revoke" and login == by:
+                raise ValueError("Себя убрать нельзя")
+            admins, users = ([x for x in people if x != login] for people in (admins, users))
+            if action == "promote":
+                admins.append(login)
+        console_access.set_env_line(INFO_ENV_PATH, "CONSOLE_AD_ADMINS", ", ".join(admins))
+        console_access.set_env_line(INFO_ENV_PATH, "CONSOLE_AD_USERS", ", ".join(users))
+    if action == "revoke":
+        _sign_ins.end_all(login)
+    return login, name or ""
+
+
+def _owns_workspace(workspace: str, login: str) -> bool:
+    """A workspace belongs to the first AD account that uses it: on a PC two
+    people share, the second one doesn't get the first one's saved logins."""
+    owner_path = OPERATORS_DIR / workspace / "ad_login"
+    with _workspaces_lock:
+        if owner_path.exists():
+            return owner_path.read_text(encoding="utf-8").strip() == login
+        console_access.replace_file(owner_path, login + "\n")
+        return True
+
+
+def _log_sign_in(client_ip: str, login: str, result: str) -> None:
+    entry = {
+        "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ip": client_ip, "login": login, "result": result,
+    }
+    with _audit_lock:
+        AD_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AD_LOG_PATH.open("a", encoding="utf-8") as log:
+            log.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
 
 # When each workspace last made a request: the CRM browser of one idle for
 # _WORKSPACE_IDLE_SECONDS is closed (its saved logins stay on disk).
@@ -529,6 +657,9 @@ _JOURNAL_KINDS = {
     "password_execute": "Сброс пароля",
     "group_execute": "Группа",
     "role_execute": "Роль",
+    "grant": "Доступ открыт",
+    "revoke": "Доступ закрыт",
+    "promote": "Назначен админ",
 }
 _JOURNAL_PROBLEMS = {"permissions_error": "права", "route_error": "маршрут", "devices_error": "устройство", "objects_error": "Objects"}
 _JOURNAL_LIMITS = (10, 25, 50, 100)
@@ -540,8 +671,9 @@ _journal_access: dict[str, float] = {}
 
 def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
     """One line of the audit log as the journal shows it. ``who`` is only
-    what was recorded: the CRM and Webitel logins the browser worked
-    under, or its address when it had neither."""
+    what was recorded: the AD account signed in to the console, the CRM
+    and Webitel logins the browser worked under, or its address when
+    there was none of them."""
 
     def first(*keys: str) -> str:
         return next((str(entry[key]) for key in keys if entry.get(key)), "")
@@ -561,7 +693,7 @@ def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
     problems = [f"{label}: {entry[key]}" for key, label in _JOURNAL_PROBLEMS.items() if entry.get(key)]
     if entry.get("error"):
         problems.append(str(entry["error"]))
-    logins = [first(key).split("@")[0] for key in ("crm_login", "webitel_login")]
+    logins = [first(key).split("@")[0] for key in ("ad_login", "crm_login", "webitel_login")]
     return {
         "time": first("time"),
         "city": _CITY_NAMES.get(first("city"), first("city")),
@@ -671,7 +803,7 @@ _INDEX_HTML = """<!doctype html>
   .status-dot.critical{background:var(--danger);box-shadow:0 0 8px rgba(240,90,75,.55);}
   .saved-login{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;padding:10px 14px;margin-bottom:12px;background:var(--surface-2);border:1px solid var(--border);border-radius:var(--radius-sm);font-size:13px;color:var(--text-soft);}
   .saved-login b{color:var(--text);font-weight:600;}
-  .saved-login-actions{display:flex;gap:6px;}
+  .saved-login-actions{display:flex;align-items:center;gap:6px;}
   button.icon-btn{display:inline-flex;align-items:center;justify-content:center;padding:6px 8px;}
   button.icon-btn:hover{color:var(--danger-dark);border-color:rgba(255,123,109,.4);background:var(--danger-soft);}
   .card-head .pill{margin-left:auto;}
@@ -793,7 +925,7 @@ _INDEX_HTML = """<!doctype html>
   .split-side .result-card{margin-top:12px;}
   .split-side > .row{margin-top:14px;}
   .split-placeholder{display:none;}
-  .login-column{display:flex;flex-direction:column;gap:16px;}
+  .login-column,.side-column{display:flex;flex-direction:column;gap:16px;}
   .code-banner{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;padding:11px 16px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;color:var(--text);font-weight:500;}
   .code-banner::before{content:"⚠";color:var(--amber);font-size:15px;margin-right:-4px;}
   .code-banner button{margin-left:auto;}
@@ -906,6 +1038,7 @@ _INDEX_HTML = """<!doctype html>
 </header>
 <div class="page">
   <div id="outdatedBanner" class="code-banner" hidden>Консоль обновилась. <button type="button" id="btnReload">Обновить страницу</button></div>
+  <div id="adBanner" class="code-banner" hidden>Вход в консоль закончился. <button type="button" id="btnAdLogin">Войти снова</button></div>
   <div id="crmCodeBanner" class="code-banner" hidden>CRM просит код подтверждения. <button type="button" id="btnGoToCode">Ввести код</button></div>
   <div class="page-head">
     <div>
@@ -924,6 +1057,7 @@ _INDEX_HTML = """<!doctype html>
   <section class="app-section" data-section-panel="account" hidden>
   <div class="steps cols-2">
 
+  <div class="side-column">
   <div class="card">
     <div class="card-head"><h2>Настройки — свои учётные данные</h2></div>
     <div class="card-body">
@@ -938,6 +1072,28 @@ _INDEX_HTML = """<!doctype html>
       </div>
       <div id="settingsMsg" class="msg info"></div>
     </div>
+  </div>
+
+  <div class="card" id="accessCard" hidden>
+    <div class="card-head"><h2>Доступ в консоль</h2></div>
+    <div class="card-body">
+      <div class="saved-login">
+        <span class="saved-login-text">Вы вошли как <b id="accessMe"></b></span>
+        <span class="saved-login-actions"><button type="button" class="ghost" id="btnAdLogout">Выйти</button></span>
+      </div>
+      <div id="accessAdmin" hidden>
+        <div class="row">
+          <div class="field-group">
+            <label class="field-label" for="accessLogin">Логин AD</label>
+            <input type="text" id="accessLogin" placeholder="напр. i.ivanov" autocomplete="off" spellcheck="false">
+          </div>
+          <button type="button" id="btnAccessGrant">Добавить</button>
+        </div>
+        <div id="accessMsg" class="msg info"></div>
+        <div id="accessList" class="list"></div>
+      </div>
+    </div>
+  </div>
   </div>
 
   <div class="login-column">
@@ -1483,6 +1639,7 @@ async function api(path, body) {
   if (!res.ok) {
     // Never reloads by itself: passwords may still be on the screen.
     if (data.outdated) document.getElementById('outdatedBanner').hidden = false;
+    if (data.ad_login) document.getElementById('adBanner').hidden = false;
     const err = new Error(data.error || ('HTTP ' + res.status));
     err.data = data;
     throw err;
@@ -1491,6 +1648,7 @@ async function api(path, body) {
 }
 
 document.getElementById('btnReload').addEventListener('click', () => location.reload());
+document.getElementById('btnAdLogin').addEventListener('click', () => location.reload());
 
 const navButtons = document.querySelectorAll('.nav-link, .nav-account-btn');
 const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password', 'roles'];
@@ -2585,6 +2743,61 @@ document.getElementById('journalQuery').addEventListener('keydown', event => {
   if (event.key === 'Enter') loadJournal(0);
 });
 
+// «Доступ в консоль»: who is signed in and, for an admin, who may sign in.
+function accessRow(user, me) {
+  const role = user.admin
+    ? '<span class="pill neutral">админ</span>'
+    : `<button type="button" class="ghost" data-access="promote" data-login="${esc(user.login)}">Сделать админом</button>`;
+  const remove = user.login === me
+    ? ''
+    : `<button type="button" class="ghost" data-access="revoke" data-login="${esc(user.login)}">Убрать</button>`;
+  const label = [user.login, user.name].filter(Boolean).join(' — ');
+  return `<div class="field"><span class="k">${esc(label)}</span><span class="saved-login-actions">${role}${remove}</span></div>`;
+}
+
+function showAccess(data) {
+  document.getElementById('accessCard').hidden = !data.me;
+  document.getElementById('accessMe').textContent = data.me;
+  document.getElementById('accessAdmin').hidden = !data.users;
+  document.getElementById('accessList').innerHTML = (data.users || []).map(user => accessRow(user, data.me)).join('');
+}
+
+async function changeAccess(action, login, btn) {
+  const msgEl = document.getElementById('accessMsg');
+  btn.disabled = true;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Проверяю...';
+  try {
+    const data = await api('/api/access/' + action, {login});
+    showAccess(data);
+    msgEl.textContent = {grant: 'Доступ открыт: ', revoke: 'Доступ закрыт: ', promote: 'Теперь админ: '}[action] + data.changed;
+    if (action === 'grant') document.getElementById('accessLogin').value = '';
+  } catch (e) {
+    msgEl.className = 'msg error';
+    msgEl.textContent = e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+const btnAccessGrant = document.getElementById('btnAccessGrant');
+btnAccessGrant.addEventListener('click', () => changeAccess('grant', document.getElementById('accessLogin').value, btnAccessGrant));
+document.getElementById('accessLogin').addEventListener('keydown', event => {
+  if (event.key === 'Enter' && !btnAccessGrant.disabled) btnAccessGrant.click();
+});
+document.getElementById('accessList').addEventListener('click', event => {
+  const btn = event.target.closest('[data-access]');
+  if (!btn) return;
+  const {access, login} = btn.dataset;
+  const question = access === 'promote' ? `Сделать админом: ${login}?` : `Закрыть доступ в консоль: ${login}?`;
+  if (confirm(question)) changeAccess(access, login, btn);
+});
+document.getElementById('btnAdLogout').addEventListener('click', async () => {
+  await api('/api/ad/logout').catch(() => {});
+  location.reload();
+});
+api('/api/access').then(showAccess).catch(() => {});
+
 let currentRolePlan = null;
 
 // Letters on Permissions → Objects, as its columns name them.
@@ -3150,6 +3363,81 @@ _FORBIDDEN_HTML = """<!doctype html>
 """
 
 
+# The console's front door when CONSOLE_AD_DOMAIN is set.
+_SIGN_IN_HTML = """<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Консоль оператора — вход</title>
+<style>
+  :root{color-scheme:dark;}
+  *{box-sizing:border-box;}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0c0c0b;color:#f3f3ef;font-size:14px;line-height:1.5;
+    font-family:"Inter","Segoe UI Variable Text","Segoe UI",system-ui,sans-serif;}
+  form{width:min(360px,calc(100vw - 32px));padding:30px 28px 26px;background:#1b1b19;border:1px solid rgba(255,255,255,.07);border-radius:20px;}
+  h1{font-size:22px;font-weight:650;letter-spacing:-.03em;margin:0 0 20px;}
+  label{display:block;font-size:12px;font-weight:500;color:#a9a9a2;margin:0 0 6px;}
+  input{width:100%;padding:10px 13px;margin:0 0 14px;border:1px solid rgba(255,255,255,.07);border-radius:12px;font:inherit;background:#232321;color:#f3f3ef;}
+  input:focus{outline:none;border-color:rgba(184,242,108,.55);box-shadow:0 0 0 3px rgba(184,242,108,.11);}
+  button{width:100%;padding:11px 16px;margin-top:6px;border:0;border-radius:999px;font:inherit;font-weight:600;background:#f3f3ef;color:#121211;cursor:pointer;}
+  button:disabled{background:#2d2d2a;color:#73736c;cursor:default;}
+  #error{color:#ff7b6d;margin:14px 0 0;}
+  #error:empty{display:none;}
+</style>
+</head>
+<body>
+<form id="form">
+  <h1>Консоль оператора</h1>
+  <label for="login">Логин AD</label>
+  <input type="text" id="login" autocomplete="username" autocapitalize="off" spellcheck="false">
+  <label for="password">Пароль</label>
+  <input type="password" id="password" autocomplete="current-password">
+  <button id="submit">Войти</button>
+  <p id="error" role="alert"></p>
+</form>
+<script>
+const login = document.getElementById('login');
+const password = document.getElementById('password');
+const button = document.getElementById('submit');
+const error = document.getElementById('error');
+login.focus();
+document.getElementById('form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (button.disabled) return;
+  error.textContent = '';
+  if (!login.value.trim() || !password.value) {
+    error.textContent = 'Введите логин и пароль';
+    return;
+  }
+  button.disabled = true;
+  button.textContent = 'Проверяю...';
+  try {
+    const response = await fetch('/api/ad/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({login: login.value, password: password.value}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) {
+      location.reload();
+      return;
+    }
+    error.textContent = data.error || 'HTTP ' + response.status;
+  } catch (e) {
+    error.textContent = 'Консоль не отвечает';
+  }
+  button.disabled = false;
+  button.textContent = 'Войти';
+  password.value = '';
+  password.focus();
+});
+</script>
+</body>
+</html>
+"""
+
+
 def _read_json_body(handler: BaseHTTPRequestHandler) -> dict[str, Any]:
     length = int(handler.headers.get("Content-Length", "0") or "0")
     if length == 0:
@@ -3178,17 +3466,26 @@ class Handler(BaseHTTPRequestHandler):
 
     # Set while answering a page load that started a new workspace.
     _new_workspace_token = ""
+    # Set while answering a sign-in (its cookie) or a sign-out ("").
+    _new_ad_token: str | None = None
+    # The AD account this request is signed in as ("" without CONSOLE_AD_DOMAIN).
+    _ad_login = ""
 
     def _send_common_headers(self) -> None:
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "no-referrer")
+        secure = "; Secure" if _TLS_ENABLED else ""
+        if self._new_ad_token is not None:
+            max_age = console_access.SESSION_SECONDS if self._new_ad_token else 0
+            self.send_header(
+                "Set-Cookie", f"{_AD_COOKIE}={self._new_ad_token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}"
+            )
         if self._new_workspace_token:
             # A year, so the browser keeps its workspace and saved logins. Lax,
             # not Strict: following a link to the console from another site
             # must not start an empty workspace in place of this one.
-            secure = "; Secure" if _TLS_ENABLED else ""
             self.send_header(
                 "Set-Cookie",
                 f"{_WORKSPACE_COOKIE}={self._new_workspace_token}; Path=/; "
@@ -3220,12 +3517,61 @@ class Handler(BaseHTTPRequestHandler):
     def _client_ip(self) -> str:
         return str(self.client_address[0])
 
-    def _workspace_token(self) -> str:
+    def _cookie(self, name: str) -> str:
         try:
-            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(_WORKSPACE_COOKIE)
+            morsel = SimpleCookie(self.headers.get("Cookie", "")).get(name)
         except CookieError:
             return ""
-        return morsel.value if morsel and _WORKSPACE_TOKEN_RE.fullmatch(morsel.value) else ""
+        return morsel.value if morsel else ""
+
+    def _workspace_token(self) -> str:
+        """This browser's workspace cookie, if it is this AD account's."""
+        token = self._cookie(_WORKSPACE_COOKIE)
+        if not _WORKSPACE_TOKEN_RE.fullmatch(token):
+            return ""
+        return token if not _AD_DOMAIN or _owns_workspace(_workspace_id(token), self._ad_login) else ""
+
+    def _signed_in_as(self) -> str:
+        """The AD account this browser is signed in as, "" if none or if it
+        isn't let in (any more)."""
+        login = _sign_ins.login_of(self._cookie(_AD_COOKIE))
+        return login if login and any(login in people for people in _ad_people()) else ""
+
+    def _sign_in(self, body: dict[str, Any]) -> None:
+        ip = self._client_ip()
+        login = console_access.normalize_login(str(body.get("login") or ""), _AD_DOMAIN)
+        listed = any(login in people for people in _ad_people())
+        with _ad_lock:
+            wait = max(_ad_address_throttle.wait_seconds(ip), _ad_throttle.wait_seconds(login))
+            # Only those on the list are asked about: not a way to guess
+            # the passwords of the whole domain, or to lock its accounts.
+            if wait > 0:
+                problem = "too many"
+            elif listed:
+                problem = console_access.check_password(login, _AD_DOMAIN, str(body.get("password") or ""))
+            else:
+                problem = "wrong"
+            if problem == "wrong":
+                _ad_address_throttle.failed(ip)
+                if listed:
+                    _ad_throttle.failed(login)
+            elif not problem:
+                _ad_address_throttle.succeeded(ip)
+                _ad_throttle.succeeded(login)
+        # What was typed is logged only when it is a known login: people
+        # type passwords into the wrong field.
+        _log_sign_in(ip, login if listed else "не из списка", problem or "ok")
+        if problem:
+            status, error = {
+                "too many": (429, f"Слишком много попыток. Повторите через {int(wait // 60) + 1} мин"),
+                "expired": (403, "Пароль AD истёк — смените его и войдите снова"),
+                "unavailable": (503, "Домен не отвечает, попробуйте ещё раз"),
+            }.get(problem, (403, "Неверный логин или пароль, или нет доступа к консоли"))
+            self._send_json(status, {"error": error})
+            return
+        _sign_ins.end(self._cookie(_AD_COOKIE))
+        self._new_ad_token = _sign_ins.start(login)
+        self._send_json(200, {"signed_in": login})
 
     def _cross_site(self) -> bool:
         """The API only takes JSON from the console's own page: a form or a
@@ -3257,11 +3603,12 @@ class Handler(BaseHTTPRequestHandler):
         return op
 
     def _run_audited(self, op: _Operator, plan: dict[str, Any], action: Callable[[], Any]) -> Any:
-        """Runs one Webitel change and records who made it (the CRM and
-        Webitel accounts this browser works under), on what, and whether it
-        worked."""
+        """Runs one Webitel change and records who made it (the AD account,
+        the CRM and Webitel accounts this browser works under), on what, and
+        whether it worked."""
         login_key = WEBITEL_CITY_KEYS.get(str(plan.get("city") or "almaty"), {}).get("login", "")
         details = {
+            **({"ad_login": self._ad_login} if self._ad_login else {}),
             "crm_login": _crm_login_of(op),
             "webitel_login": _operator_env(op).get(login_key, "") if login_key else "",
             **{key: plan[key] for key in _AUDIT_PLAN_FIELDS if key in plan},
@@ -3291,20 +3638,27 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def do_GET(self) -> None:  # noqa: N802
-        self._new_workspace_token = ""
+        self._new_workspace_token, self._new_ad_token, self._ad_login = "", None, ""
         if self._refuse_stranger(page=self.path == "/"):
             return
         if self.path == "/":
+            if _AD_DOMAIN:
+                self._ad_login = self._signed_in_as()
+                if not self._ad_login:
+                    self._send_html(_SIGN_IN_HTML)
+                    return
             if _SHARED and not self._workspace_token():
                 self._new_workspace_token = secrets.token_hex(16)
                 home = _named_operator(_workspace_id(self._new_workspace_token)).env_path.parent
                 home.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if _AD_DOMAIN:
+                    _owns_workspace(home.name, self._ad_login)
             self._send_html(_SHARED_INDEX_HTML if _SHARED else _INDEX_HTML)
         else:
             self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        self._new_workspace_token = ""
+        self._new_workspace_token, self._new_ad_token, self._ad_login = "", None, ""
         # Always drain the request body first, regardless of which path
         # branch below actually needs it. Responding without reading a
         # POST body the client already sent leaves unread bytes in the
@@ -3323,6 +3677,17 @@ class Handler(BaseHTTPRequestHandler):
         if self._cross_site():
             self._send_json(403, {"error": "cross-site request refused"})
             return
+        if _AD_DOMAIN:
+            if self.path == "/api/ad/login":
+                try:
+                    self._sign_in(body)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json(500, {"error": f"Вход не удался: {type(exc).__name__}"})
+                return
+            self._ad_login = self._signed_in_as()
+            if not self._ad_login:
+                self._send_json(401, {"error": "Вход в консоль закончился — обновите страницу (F5)", "ad_login": True})
+                return
         if self.headers.get("X-Console-Version") != _PAGE_VERSION:
             self._send_json(409, {"error": "Консоль обновилась — обновите страницу (F5)", "outdated": True})
             return
@@ -3331,6 +3696,28 @@ class Handler(BaseHTTPRequestHandler):
             op = self._current_operator()
             if op is None:
                 self._send_json(400, {"error": "Обновите страницу консоли — браузер не прислал свой cookie"})
+                return
+
+            if self.path == "/api/access":
+                self._send_json(200, _access_info(self._ad_login))
+                return
+
+            if self.path in ("/api/access/grant", "/api/access/revoke", "/api/access/promote") and _AD_DOMAIN:
+                try:
+                    login, name = _change_access(self._ad_login, self.path.rsplit("/", 1)[-1], str(body.get("login") or ""))
+                except (PermissionError, ValueError) as exc:
+                    self._send_json(403 if isinstance(exc, PermissionError) else 400, {"error": str(exc)})
+                    return
+                _audit(op, self._client_ip(), self.path, {
+                    "ad_login": self._ad_login, "extension": login, "name": name, "ok": True,
+                })
+                self._send_json(200, {**_access_info(self._ad_login), "changed": " — ".join(filter(None, (login, name)))})
+                return
+
+            if self.path == "/api/ad/logout" and _AD_DOMAIN:
+                _sign_ins.end(self._cookie(_AD_COOKIE))
+                self._new_ad_token = ""
+                self._send_json(200, {"signed_out": True})
                 return
 
             if self.path == "/api/settings/save":
@@ -3709,9 +4096,9 @@ def run(port: int | None = None) -> None:
     """Listens as info.env says: CONSOLE_HOST (default 127.0.0.1),
     CONSOLE_PORT (default 8765, a ``port`` argument wins), CONSOLE_SHARED=1
     (a workspace per browser), CONSOLE_TLS_CERT / CONSOLE_TLS_KEY (HTTPS;
-    paths relative to the project root) and CONSOLE_ALLOWED_NETS (who may
-    open it)."""
-    global _SHARED, _TLS_ENABLED, _ALLOWED_NETS
+    paths relative to the project root), CONSOLE_ALLOWED_NETS (from where it
+    may be opened) and CONSOLE_AD_DOMAIN / _ADMINS / _USERS (by whom)."""
+    global _SHARED, _TLS_ENABLED, _ALLOWED_NETS, _AD_DOMAIN
     env = _load_env_file(INFO_ENV_PATH)
     host = env.get("CONSOLE_HOST") or "127.0.0.1"
     port = port or int(env.get("CONSOLE_PORT") or 8765)
@@ -3732,6 +4119,10 @@ def run(port: int | None = None) -> None:
         _ALLOWED_NETS = _parse_allowed_nets(env.get("CONSOLE_ALLOWED_NETS", ""))
     except ValueError as exc:
         raise SystemExit(f"Консоль не запущена: {exc}") from exc
+    problem = _ad_problem(env, shared)
+    if problem:
+        raise SystemExit(f"Консоль не запущена: {problem}")
+    _AD_DOMAIN = env.get("CONSOLE_AD_DOMAIN", "").strip().lower()
     _SHARED = shared
     server = _ConsoleServer((host, port), Handler)
     scheme = "http"
@@ -3744,6 +4135,8 @@ def run(port: int | None = None) -> None:
         scheme = "https"
     mode = "общая, у каждого браузера свои входы" if shared else "локальная"
     access = ", ".join(str(net) for net in _ALLOWED_NETS) or "все"
+    if _AD_DOMAIN:
+        access += f", вход по AD {_AD_DOMAIN}"
     print(f"Console running at {scheme}://{host}:{port}  ({mode}; доступ: {access}; Ctrl+C to stop)")
     try:
         server.serve_forever()
