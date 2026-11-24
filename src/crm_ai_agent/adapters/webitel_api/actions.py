@@ -159,6 +159,26 @@ def group_schema(city: str, name: str, extensions: list[str], fallback: str = ""
     ]
 
 
+def schema_members(steps: Any) -> list[str]:
+    """The extensions a Flow schema's bridges call, each once, as text (the
+    schemas have both "30152" and 30152). Steps commented out with "#"
+    ("###bridge") are skipped with everything in them, and so are variables
+    in place of an extension ("${destination_number}")."""
+    found: list[str] = []
+    if isinstance(steps, list):
+        for step in steps:
+            found += schema_members(step)
+    elif isinstance(steps, dict):
+        for name, value in steps.items():
+            if name.startswith("#"):
+                continue
+            if name == "bridge" and isinstance(value, dict) and isinstance(value.get("endpoints"), list):
+                numbers = [str(e.get("extension")) for e in value["endpoints"] if isinstance(e, dict)]
+                found += [number for number in numbers if number.isdigit()]
+            found += schema_members(value)
+    return list(dict.fromkeys(found))
+
+
 def _check_group_numbers(number: str, extensions: list[str], fallback: str) -> None:
     """The group number goes into the route's pattern, so only digits
     (anything else could make a pattern that catches other numbers too); the
@@ -359,11 +379,16 @@ class WebitelApiActions:
 
     def _acl(self, path: str) -> list[dict[str, Any]]:
         """Every grant of an ACL (a user's Permissions tab, an object's on
-        Permissions → Objects), page by page while ``next`` says more follow."""
+        Permissions → Objects)."""
+        return self._rows(path)
+
+    def _rows(self, path: str) -> list[dict[str, Any]]:
+        """Every row of a list, page by page while ``next`` says more follow."""
+        separator = "&" if "?" in path else "?"
         items: list[dict[str, Any]] = []
         page = 1
         while True:
-            data = self._get(f"{path}?page={page}&size=100")
+            data = self._get(f"{path}{separator}page={page}&size=100")
             items.extend(data.get("items") or [])
             if not data.get("next"):
                 return items
@@ -811,6 +836,61 @@ class WebitelApiActions:
         known = {"web": "Web", "sip": "SIP", "dlg": "Dlg", "dnd": "DnD"}
         parts = [part.strip() for part in status.strip().strip("{}").split(",") if part.strip()]
         return [known.get(part.lower(), part) for part in parts]
+
+    def build_card(self, extension: str) -> dict[str, Any]:
+        """Read-only: whose number this is, whether they are online, and the
+        groups it is in. A number nobody has gets a card too (``user`` None):
+        it may be a group's, or a deleted user's that schemas still call.
+
+        The schemas take rights of their own in Webitel, so a failure there
+        comes back as ``groups_error``, with the rest of the card in place."""
+        card: dict[str, Any] = {"extension": extension, "user": None, "groups": [], "routes": [], "groups_error": ""}
+        try:
+            user = self.get_raw_user(extension)
+        except SubjectNotFoundError:
+            pass
+        else:
+            card["user"] = {
+                "name": user.get("name", ""),
+                "username": user.get("username", ""),
+                "presence": self.presence_labels(self.get_presence_status(extension)),
+                "group": (user.get("profile") or {}).get("group", ""),
+                "roles": [r.get("name") or r.get("id", "") for r in user.get("roles") or []],
+                "license": [x.get("prod") or x.get("id", "") for x in user.get("license") or []],
+                "devices": [d.get("name") or d.get("id", "") for d in user.get("devices") or []],
+                "created_at": user.get("created_at", ""),
+                "created_by": (user.get("created_by") or {}).get("name", ""),
+                "updated_at": user.get("updated_at", ""),
+                "updated_by": (user.get("updated_by") or {}).get("name", ""),
+            }
+        try:
+            card.update(self._groups_of(extension))
+        except WebitelApiError as exc:
+            card["groups_error"] = str(exc)
+        return card
+
+    def _groups_of(self, extension: str) -> dict[str, Any]:
+        """Read-only: ``groups`` — the Flow schemas that call this extension,
+        with the numbers the Dialplan leads to each; ``routes`` — the schemas
+        this very number leads to, with whom they call.
+
+        ``fields`` repeated (a comma-separated one gives empty rows) is what
+        makes the list bring the schemas' contents — seen 2026-11-24: 361
+        schemas in Almaty, 1.1 MB, within a second."""
+        numbers: dict[str, list[str]] = {}
+        for route in self._rows("/api/routing/outbound/calls"):
+            match = re.fullmatch(r"\^\(?(\d+)\)?\$", route.get("pattern") or "")
+            if match and not route.get("disabled"):
+                numbers.setdefault(str((route.get("schema") or {}).get("id")), []).append(match.group(1))
+        groups, routes = [], []
+        for schema in self._rows("/api/routing/schema?fields=id&fields=name&fields=schema"):
+            members = schema_members(schema.get("schema"))
+            leading_here = numbers.get(str(schema.get("id")), [])
+            if extension in members:
+                groups.append({"name": schema.get("name", ""), "numbers": leading_here})
+            if extension in leading_here:
+                routes.append({"name": schema.get("name", ""), "members": members})
+        return {"groups": groups, "routes": routes}
 
     def build_delete_plan(self, extension: str) -> dict[str, Any]:
         """Read-only: one lookup of the user to be deleted, so the

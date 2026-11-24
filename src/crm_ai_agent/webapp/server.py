@@ -667,6 +667,7 @@ _JOURNAL_LIMITS = (10, 25, 50, 100)
 # journal before Webitel is asked again.
 _JOURNAL_ACCESS_SECONDS = 300
 _journal_access: dict[str, float] = {}
+_CARD_HISTORY_LIMIT = 50
 
 
 def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -707,22 +708,41 @@ def _journal_entry(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _audit_entries() -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """The audit log, newest first: each entry and how the journal shows it."""
+    with _audit_lock:
+        lines = AUDIT_LOG_PATH.read_text(encoding="utf-8-sig").splitlines() if AUDIT_LOG_PATH.exists() else []
+    entries = []
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+            entries.append((entry, _journal_entry(entry)))
+        except (ValueError, AttributeError, TypeError):
+            continue  # a line cut short by a crash must not hide the rest
+    return entries
+
+
 def _read_journal(query: str, offset: int, limit: int) -> dict[str, Any]:
     """The audit log, newest first; every word of ``query`` has to be
     somewhere in what an entry shows."""
-    with _audit_lock:
-        lines = AUDIT_LOG_PATH.read_text(encoding="utf-8-sig").splitlines() if AUDIT_LOG_PATH.exists() else []
     words = query.lower().split()
     found = []
-    for line in reversed(lines):
-        try:
-            shown = _journal_entry(json.loads(line))
-        except (ValueError, AttributeError, TypeError):
-            continue  # a line cut short by a crash must not hide the rest
+    for _, shown in _audit_entries():
         text = " ".join(shown[key] for key in ("kind", "city", "number", "name", "details", "who")).lower()
         if all(word in text for word in words):
             found.append(shown)
     return {"entries": found[offset:offset + limit], "total": len(found)}
+
+
+def _number_history(number: str, city: str) -> list[dict[str, Any]]:
+    """What was done to this number (or to a group it was made a member of)
+    through the console, newest first. Serving as a copying template is not
+    something done to it."""
+    return [
+        shown for entry, shown in _audit_entries()
+        if str(entry.get("city") or "almaty") == city
+        and (shown["number"] == number or any(str(m.get("extension")) == number for m in entry.get("members") or []))
+    ][:_CARD_HISTORY_LIMIT]
 
 
 def _may_read_journal(op: _Operator) -> bool:
@@ -928,9 +948,11 @@ _INDEX_HTML = """<!doctype html>
   .split-side > .row{margin-top:14px;}
   .split-placeholder{display:none;}
   .login-column,.side-column{display:flex;flex-direction:column;gap:16px;}
-  .code-banner{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;padding:11px 16px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;color:var(--text);font-weight:500;}
+  .code-banner{position:relative;display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px;padding:11px 16px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;color:var(--text);font-weight:500;}
   .code-banner::before{content:"⚠";color:var(--amber);font-size:15px;margin-right:-4px;}
   .code-banner button{margin-left:auto;}
+  .code-banner .banner-close{position:absolute;top:-9px;right:-9px;margin:0;display:grid;place-items:center;width:24px;height:24px;padding:0;background:var(--amber-bg);color:var(--text-soft);border:1px solid rgba(245,170,61,.35);}
+  .code-banner .banner-close:hover{background:var(--surface-3);color:var(--text);}
   .code-box{margin:12px 0 0;padding:14px;border:1px solid rgba(245,170,61,.35);background:var(--amber-bg);border-radius:14px;}
   .code-box input{font-size:18px;letter-spacing:.25em;font-variant-numeric:tabular-nums;font-family:var(--mono);}
   .screenshot-btn{margin-top:10px;}
@@ -976,12 +998,16 @@ _INDEX_HTML = """<!doctype html>
   .limit-btn.active,.limit-btn.active:hover{background:var(--surface-3);color:var(--text);box-shadow:inset 0 0 0 1px var(--border-strong);}
 
   /* Low windows: everything in the rail has to fit. */
-  @media (max-height:800px) and (min-width:761px){
+  @media (max-height:840px) and (min-width:761px){
     .rail{padding:10px 0;gap:2px;}
     .rail-logo{width:32px;height:32px;margin-bottom:4px;}
     .rail-links{gap:0;}
     .nav-link,.nav-account-btn{padding:4px 0;gap:3px;}
     .rail-icon{width:36px;height:36px;}
+  }
+  @media (max-height:660px) and (min-width:761px){
+    .nav-link,.nav-account-btn{padding:3px 0;}
+    .rail-icon{width:32px;height:32px;}
   }
 
   /* Phones and narrow windows: the rail becomes a scrolling bar on top. */
@@ -1025,6 +1051,7 @@ _INDEX_HTML = """<!doctype html>
     <button type="button" class="nav-link" data-section="groups" data-title="Групповой номер" title="Группы"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span><span class="rail-label">Группы</span></button>
     <button type="button" class="nav-link" data-section="password" data-title="Сброс пароля" title="Пароль"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6"/><path d="m15.5 7.5 3 3L22 7l-3-3"/></svg></span><span class="rail-label">Пароль</span></button>
     <button type="button" class="nav-link" data-section="roles" data-title="Роль Webitel" title="Роли"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></svg></span><span class="rail-label">Роли</span></button>
+    <button type="button" class="nav-link" data-section="number" data-title="Карточка номера" title="Номер"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="3"/><circle cx="9" cy="11" r="2.3"/><path d="M5.8 16.4a3.4 3.4 0 0 1 6.4 0"/><path d="M15 10h3"/><path d="M15 14h3"/></svg></span><span class="rail-label">Номер</span></button>
     <button type="button" class="nav-link" data-section="journal" data-title="Журнал" title="Журнал"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></span><span class="rail-label">Журнал</span></button>
   </nav>
   <button type="button" class="nav-account-btn" data-section="account" data-title="Вход и настройки" title="Вход и настройки"><span class="rail-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/></svg><span class="status-dot" id="navLoginDot" title="CRM: не выполнен вход"></span></span><span class="rail-label">Вход</span></button>
@@ -1042,7 +1069,7 @@ _INDEX_HTML = """<!doctype html>
 <div class="page">
   <div id="outdatedBanner" class="code-banner" hidden>Консоль обновилась. <button type="button" id="btnReload">Обновить страницу</button></div>
   <div id="adBanner" class="code-banner" hidden>Вход в консоль закончился. <button type="button" id="btnAdLogin">Войти снова</button></div>
-  <div id="crmCodeBanner" class="code-banner" hidden>CRM просит код подтверждения. <button type="button" id="btnGoToCode">Ввести код</button></div>
+  <div id="crmCodeBanner" class="code-banner" hidden>CRM просит код подтверждения. <button type="button" id="btnGoToCode">Ввести код</button><button type="button" class="banner-close" id="btnCloseCode" title="Скрыть" aria-label="Скрыть"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12"/><path d="M18 6L6 18"/></svg></button></div>
   <div class="page-head">
     <div>
       <h1 id="pageTitle">Заявка</h1>
@@ -1589,6 +1616,32 @@ _INDEX_HTML = """<!doctype html>
   </div>
   </section>
 
+  <section class="app-section" data-section-panel="number" hidden>
+  <div class="steps">
+
+  <div class="card">
+    <div class="card-head"><h2>Webitel: карточка номера</h2></div>
+    <div class="card-body">
+      <div class="row">
+        <div class="field-group">
+          <input type="text" id="cardNumber" placeholder="напр. 10087" aria-label="Номер" autocomplete="off">
+        </div>
+        <button id="btnCard">Показать</button>
+      </div>
+      <div id="cardMsg" class="msg info"></div>
+      <div class="split" id="cardResult" hidden>
+        <div id="cardInfo" class="result-card"></div>
+        <div>
+          <div class="form-step-title">Через консоль</div>
+          <div id="cardHistory" class="list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  </div>
+  </section>
+
   <section class="app-section" data-section-panel="journal" hidden>
   <div class="steps">
 
@@ -1648,7 +1701,7 @@ document.getElementById('btnReload').addEventListener('click', () => location.re
 document.getElementById('btnAdLogin').addEventListener('click', () => location.reload());
 
 const navButtons = document.querySelectorAll('.nav-link, .nav-account-btn');
-const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password', 'roles'];
+const CITY_PICKER_SECTIONS = ['copy', 'create', 'delete', 'groups', 'password', 'roles', 'number'];
 
 navButtons.forEach(btn => {
   btn.addEventListener('click', () => {
@@ -1689,7 +1742,7 @@ const CITY_PLACEHOLDERS = {
     templateExt: 'напр. 10078', targetExt: 'напр. 10079, 10085-10090',
     singleNewLogin: 'напр. 10087', singleTemplateExt: 'напр. 10078',
     createTemplateExt: 'напр. 10078', createBulkList: '10087,Иван Иванов\\n10097,Мария Петрова',
-    deleteExt: 'напр. 10087, 10090-10095', passwordExt: 'напр. 10087, 10097',
+    deleteExt: 'напр. 10087, 10090-10095', passwordExt: 'напр. 10087, 10097', cardNumber: 'напр. 10087',
     groupNumber: 'напр. 30151', groupName: 'напр. ALM-OP-30151', groupMembers: 'напр. 30152, 30153',
     groupBulkList: '30151, ALM-OP-30151: 30152, 30153\\n30161, ALM-OP-30161: 30162, 30163',
   },
@@ -1697,7 +1750,7 @@ const CITY_PLACEHOLDERS = {
     templateExt: 'напр. 28070', targetExt: 'напр. 28071, 28075-28080',
     singleNewLogin: 'напр. 28071', singleTemplateExt: 'напр. 28070',
     createTemplateExt: 'напр. 28070', createBulkList: '28071,Иван Иванов\\n28075,Мария Петрова',
-    deleteExt: 'напр. 28071, 28075-28080', passwordExt: 'напр. 28071, 28075',
+    deleteExt: 'напр. 28071, 28075-28080', passwordExt: 'напр. 28071, 28075', cardNumber: 'напр. 28071',
     groupNumber: 'напр. 21701', groupName: 'напр. BMW Astana - 21701', groupMembers: 'напр. 21703, 21704',
     groupBulkList: '21701, BMW Astana - 21701: 21703, 21704 > 21700\\n28020, AST-AMP - 28020: 21322, 21323',
   },
@@ -1895,6 +1948,9 @@ let polling = false;
 
 let crmLoginState = 'idle';
 let lastAutoLogin = 0;
+// The operator closed the code banner (no need of the CRM now): the polling and
+// the console's own re-logins don't bring it back, their own login does.
+let codeBannerClosed = false;
 
 // Re-login with the remembered account, but never more than once a minute —
 // a wrong saved password must not turn into a login loop.
@@ -1928,7 +1984,8 @@ function setLoginState(state) {
     code: ['нужен код', 'pill warn', 'warn', 'CRM: нужен код подтверждения'],
   };
   crmLoginState = state;
-  document.getElementById('crmCodeBanner').hidden = state !== 'code';
+  if (state === 'ready') codeBannerClosed = false;
+  document.getElementById('crmCodeBanner').hidden = state !== 'code' || codeBannerClosed;
   const [text, pillClass, dotClass, title] = states[state];
   loginStatusEl.textContent = text;
   loginStatusEl.className = pillClass;
@@ -1994,6 +2051,7 @@ async function startCrmLogin(payload) {
 }
 
 document.getElementById('btnLogin').addEventListener('click', () => {
+  codeBannerClosed = false;
   const login = document.getElementById('crmLogin').value.trim();
   const password = document.getElementById('crmPassword').value;
   if (!loginFormEl.hidden && (login || password || !savedCrmLogin)) {
@@ -2072,6 +2130,11 @@ document.getElementById('btnCrmScreenshot').addEventListener('click', async () =
 document.getElementById('btnGoToCode').addEventListener('click', () => {
   document.querySelector('.nav-account-btn').click();
   crmCodeInput.focus();
+});
+
+document.getElementById('btnCloseCode').addEventListener('click', () => {
+  codeBannerClosed = true;
+  document.getElementById('crmCodeBanner').hidden = true;
 });
 
 // While the console shows "вход выполнен", check once a minute that the CRM
@@ -2738,6 +2801,69 @@ document.querySelectorAll('.limit-btn').forEach(btn => {
 document.getElementById('btnJournalMore').addEventListener('click', () => loadJournal(journalShown));
 document.getElementById('journalQuery').addEventListener('keydown', event => {
   if (event.key === 'Enter') loadJournal(0);
+});
+
+// «Номер»: whose it is, its groups and what the console did with it. Only reads.
+let cardRequest = 0;
+
+function cardField(label, lines) {
+  return `<div class="field"><span class="k">${esc(label)}</span><span class="v">${lines.filter(Boolean).map(esc).join('<br>') || '—'}</span></div>`;
+}
+
+function cardDate(ms, who) {
+  const when = Number(ms) ? new Date(Number(ms)).toLocaleString('ru-RU', {day: '2-digit', month: '2-digit', year: '2-digit', hour: '2-digit', minute: '2-digit'}) : '';
+  return [when, who].filter(Boolean).join(' · ');
+}
+
+function cardFields(card) {
+  const user = card.user;
+  const groups = card.groups_error ? ['не удалось прочитать: ' + card.groups_error]
+    : card.groups.map(g => [g.name, g.numbers.join(', ')].filter(Boolean).join(' · '));
+  const routes = card.routes.map(r => cardField('Звонки на номер', ['схема «' + r.name + '»', r.members.length ? 'звонит: ' + r.members.join(', ') : '']));
+  if (!user) return [...routes, ...(groups.length ? [cardField('Остался в группах', groups)] : [])].join('');
+  const presence = user.presence.join(', ');
+  return [
+    cardField('Имя', [user.name]),
+    cardField('Логин', [user.username]),
+    cardField('Статус', [user.presence.includes('Dlg') ? `идёт разговор (${presence})` : presence ? 'в сети — ' + presence : 'не в сети']),
+    cardField('Группа', [user.group]),
+    cardField('Роли', user.roles),
+    cardField('Лицензии', [user.license.join(', ')]),
+    cardField('Устройство', user.devices),
+    cardField('В группах', groups.length ? groups : ['не состоит']),
+    ...routes,
+    cardField('Создан', [cardDate(user.created_at, user.created_by)]),
+    cardField('Изменён', [cardDate(user.updated_at, user.updated_by)]),
+  ].join('');
+}
+
+async function showCard() {
+  const msgEl = document.getElementById('cardMsg');
+  const resultEl = document.getElementById('cardResult');
+  const infoEl = document.getElementById('cardInfo');
+  const historyEl = document.getElementById('cardHistory');
+  const request = ++cardRequest;
+  resultEl.hidden = true;
+  msgEl.className = 'msg info';
+  msgEl.textContent = 'Поиск...';
+  try {
+    const card = await api('/api/webitel/card', {extension: document.getElementById('cardNumber').value, city: selectedCity});
+    if (request !== cardRequest) return;  // a newer search is already on its way
+    infoEl.innerHTML = cardFields(card);
+    infoEl.hidden = !infoEl.innerHTML;
+    historyEl.innerHTML = card.history.map(journalRow).join('') || '<div class="msg info">С этим номером ничего не делали.</div>';
+    msgEl.textContent = `${card.city_name}, ${card.extension}` + (card.user ? '' : card.routes.length ? ' — групповой номер' : ' — такого пользователя нет');
+    resultEl.hidden = false;
+  } catch (e) {
+    if (request !== cardRequest) return;
+    msgEl.className = 'msg error';
+    msgEl.textContent = e.message;
+  }
+}
+
+document.getElementById('btnCard').addEventListener('click', showCard);
+document.getElementById('cardNumber').addEventListener('keydown', event => {
+  if (event.key === 'Enter') showCard();
 });
 
 // Who is signed in (top right) and, for an admin, who may («Доступ в консоль»).
@@ -3884,6 +4010,18 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json(200, _start_webitel_login(op, city))
                 except ValueError as exc:
                     self._send_json(400, {"error": str(exc)})
+                return
+
+            if self.path == "/api/webitel/card":
+                extension = str(body.get("extension") or "").strip()
+                city = str(body.get("city") or "almaty").strip() or "almaty"
+                if not re.fullmatch(r"[0-9]{1,15}", extension):
+                    self._send_json(400, {"error": "Укажите один номер, только цифры"})
+                    return
+                # Colleagues' names are in the history as well: it comes only
+                # after Webitel has answered this browser's own session.
+                card = _get_webitel_actions(op, city).build_card(extension)
+                self._send_json(200, {**card, "city_name": _CITY_NAMES.get(city, city), "history": _number_history(extension, city)})
                 return
 
             if self.path == "/api/webitel/plan":

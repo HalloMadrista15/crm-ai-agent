@@ -6,6 +6,7 @@ shapes confirmed via a shared Postman collection (2026-09-11).
 
 import json
 import unittest
+import urllib.error
 from io import BytesIO
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from crm_ai_agent.adapters.webitel_api.actions import (
     WebitelNoAnswerError,
     generate_password,
     group_schema,
+    schema_members,
 )
 from crm_ai_agent.adapters.webitel_api.session import WebitelApiSession
 from crm_ai_agent.ports.entity_resolver import SubjectNotFoundError
@@ -1514,6 +1516,119 @@ class TestGroupSchema(unittest.TestCase):
 
 _NO_SCHEMA = {"items": [{"id": 12, "name": "ALM-OP-30151 old"}]}  # only a partial name match
 _NO_ROUTE = {"page": 1, "items": [{"id": 5, "name": "internal", "pattern": "^30[0-9]{3}$"}]}
+
+
+class TestSchemaMembers(unittest.TestCase):
+    def test_finds_every_bridge_however_deep(self) -> None:
+        self.assertEqual(schema_members(_OPERATOR_GROUP_TEMPLATE), ["30152", "30153", "30154", "30155", "30156", "30157"])
+        steps = [
+            {"if": {"expression": "${x}", "then": [{"bridge": {"endpoints": [{"type": "user", "extension": 30152}]}}],
+                    "else": [{"switch": {"case": {"1": [{"bridge": {"endpoints": [{"type": "user", "extension": "30153"}, {"type": "user", "extension": "30152"}]}}]}}}]}},
+        ]
+        self.assertEqual(schema_members(steps), ["30152", "30153"])
+
+    def test_leaves_out_what_rings_nobody(self) -> None:
+        bridge = {"endpoints": [{"type": "user", "extension": "30152"}]}
+        self.assertEqual(schema_members([{"#bridge": bridge}, {"###bridge": bridge}, {"#if": {"then": [{"bridge": bridge}]}}]), [])
+        self.assertEqual(schema_members([{"bridge": {"endpoints": [
+            {"type": "user", "extension": "${destination_number}"}, {"type": "gateway", "dialString": "87001234567"}, {}, None, "30152",
+            {"type": "user", "#extension": "30152"}, {"type": "user", "extension": None},
+        ]}}]), [])
+
+    def test_survives_any_shape(self) -> None:
+        for steps in (None, [], {}, "x", [None, 1], [{"bridge": None}], [{"bridge": {"endpoints": None}}], [{"bridge": {"endpoints": {"extension": "30152"}}}]):
+            self.assertEqual(schema_members(steps), [], steps)
+
+
+class TestBuildCard(unittest.TestCase):
+    """Answers are given by path, so the test holds whatever the order."""
+
+    USER = {"id": "6197", "name": "TEST1", "username": "30120", "extension": "30120", "profile": {"group": "7719499781"},
+            "roles": [{"id": "28", "name": "users"}, {"id": "5"}], "license": [{"id": "l1", "prod": "MOBILE"}],
+            "devices": [{"id": "150571", "name": "30120"}], "created_at": "1792387449889", "created_by": {"id": "1", "name": "Admin"},
+            "updated_at": "1795437074474", "updated_by": {"id": "2", "name": "Madi"}, "password": "must-not-leave"}
+    ROUTES = [
+        {"id": "1", "name": "r", "pattern": "^30200$", "schema": {"id": "71", "name": "ALM-OP"}},
+        {"id": "2", "name": "r", "pattern": "^(30201)$", "schema": {"id": "71"}},
+        {"id": "3", "name": "r", "pattern": "^30299$", "schema": {"id": "71"}, "disabled": True},
+        {"id": "4", "name": "r", "pattern": "^30[0-9]{3}$", "schema": {"id": "72"}},
+        {"id": "5", "name": "no schema", "pattern": "^30120$"},
+        {"id": "6", "name": "no pattern"},
+    ]
+    SCHEMAS = [
+        {"id": "71", "name": "ALM-OP", "schema": group_schema("almaty", "ALM-OP", ["30120", "30121"])},
+        {"id": "72", "name": "IVR", "schema": [{"if": {"then": [{"bridge": {"endpoints": [{"type": "user", "extension": 30120}]}}]}}]},
+        {"id": "73", "name": "Other", "schema": group_schema("almaty", "Other", ["301200", "3012"])},
+        {"id": "74", "name": "Off", "schema": [{"#bridge": {"endpoints": [{"type": "user", "extension": "30120"}]}}]},
+        {"id": "75", "name": "Empty"},
+    ]
+
+    def _card(self, extension: str, *, user: dict | None = None, presence: str = "", routing_error: int = 0) -> dict:
+        sent: list[tuple[str, str]] = []
+
+        def answer(request, timeout=None):
+            path = request.full_url.removeprefix("https://wtl-alm.astana-motors.kz")
+            sent.append((request.get_method(), path))
+            if path.startswith("/api/users?"):
+                row = {"id": "6197", "extension": "30120", **({"presence": {"status": presence}} if presence else {})}
+                return _FakeResponse({"items": [row, {"id": "1", "extension": "301200"}] if user else []})
+            if path == "/api/users/6197":
+                return _FakeResponse(user)
+            if routing_error:
+                raise urllib.error.HTTPError(request.full_url, routing_error, "x", {}, BytesIO(b"{}"))
+            rows = self.ROUTES if path.startswith("/api/routing/outbound/calls?") else self.SCHEMAS
+            # Two to a page, to see every page read.
+            page = int(path.split("page=")[1].split("&")[0])
+            return _FakeResponse({"items": rows[(page - 1) * 2:page * 2], **({"next": True} if len(rows) > page * 2 else {})})
+
+        with patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen", side_effect=answer):
+            card = _actions().build_card(extension)
+        self.assertEqual({method for method, _ in sent}, {"GET"})
+        self.sent = [path for _, path in sent]
+        return card
+
+    def test_tells_whose_number_it_is(self) -> None:
+        card = self._card("30120", user=self.USER, presence="{web,sip}")
+        self.assertEqual(card["user"], {
+            "name": "TEST1", "username": "30120", "presence": ["Web", "SIP"], "group": "7719499781", "roles": ["users", "5"],
+            "license": ["MOBILE"], "devices": ["30120"], "created_at": "1792387449889", "created_by": "Admin",
+            "updated_at": "1795437074474", "updated_by": "Madi",
+        })
+        self.assertNotIn("must-not-leave", json.dumps(card))
+
+    def test_lists_the_groups_it_is_in(self) -> None:
+        card = self._card("30120", user=self.USER)
+        self.assertEqual(card["groups"], [{"name": "ALM-OP", "numbers": ["30200", "30201"]}, {"name": "IVR", "numbers": []}])
+        self.assertEqual((card["routes"], card["groups_error"], card["user"]["presence"]), ([], "", []))
+        # A comma-separated list of fields brings empty rows from Webitel.
+        self.assertTrue(any(path.startswith("/api/routing/schema?fields=id&fields=name&fields=schema&page=1&") for path in self.sent))
+
+    def test_a_bare_user_record_is_enough(self) -> None:
+        card = self._card("30120", user={"id": "6197", "extension": "30120", "profile": None, "created_by": None})
+        self.assertEqual((card["user"]["name"], card["user"]["group"], card["user"]["roles"], card["user"]["devices"], card["user"]["created_by"]),
+                         ("", "", [], [], ""))
+
+    def test_a_number_nobody_has(self) -> None:
+        self.assertEqual(self._card("30121")["user"], None)
+        self.assertEqual(self._card("30121")["groups"], [{"name": "ALM-OP", "numbers": ["30200", "30201"]}])  # still called by it
+        self.assertEqual(self._card("30555")["groups"], [])
+
+    def test_a_group_number(self) -> None:
+        for number in ("30200", "30201"):
+            card = self._card(number)
+            self.assertEqual((card["user"], card["routes"]), (None, [{"name": "ALM-OP", "members": ["30120", "30121"]}]), number)
+        for number in ("30299", "30120"):  # a route switched off, and one leading to no schema
+            self.assertEqual(self._card(number)["routes"], [], number)
+
+    def test_no_rights_to_schemas_keeps_the_rest(self) -> None:
+        card = self._card("30120", user=self.USER, routing_error=403)
+        self.assertEqual((card["user"]["name"], card["groups"]), ("TEST1", []))
+        self.assertIn("HTTP 403", card["groups_error"])
+
+    def test_an_expired_session_is_an_error_not_an_empty_card(self) -> None:
+        error = urllib.error.HTTPError("u", 401, "x", {}, BytesIO(b"{}"))
+        with patch("crm_ai_agent.adapters.webitel_api.actions.urllib.request.urlopen", side_effect=error), self.assertRaises(WebitelApiError):
+            _actions().build_card("30120")
 
 
 class TestFindRoute(unittest.TestCase):

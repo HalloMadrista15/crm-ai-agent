@@ -666,6 +666,66 @@ class TestSharedConsole(unittest.TestCase):
                 server._journal_access[workspace] -= server._JOURNAL_ACCESS_SECONDS + 1
             self.assertEqual(self._post("/api/journal", {}, cookie=cookie)[0], 403)
 
+    def _card(self, extension: object, city: str = "almaty", **card: object):
+        actions = mock.Mock()
+        actions.build_card.return_value = {"extension": extension, "user": None, "groups": [], "routes": [], "groups_error": "", **card}
+        with mock.patch.object(server, "_get_webitel_actions", return_value=actions):
+            status, data = self._post("/api/webitel/card", {"extension": extension, "city": city}, cookie=self._new_browser())
+        self.assertEqual([call[0] for call in actions.method_calls if call[0] != "build_card"], [])
+        return status, data, actions
+
+    def test_the_card_comes_with_what_was_done_to_the_number(self) -> None:
+        self._write_log(
+            {"action": "/api/webitel/create_execute", "city": "almaty", "new_extension": "74100", "new_name": "Иван", "template_extension": "30119"},
+            {"action": "/api/webitel/execute", "city": "almaty", "target_extension": "30120", "template_extension": "74100"},  # only a template
+            {"action": "/api/webitel/password_execute", "city": "astana", "extension": "74100", "name": "Чужой"},  # another city
+            {"action": "/api/webitel/delete_execute", "city": "almaty", "extension": "741001", "name": "x"},
+            {"action": "/api/webitel/group_execute", "city": "almaty", "number": "30200", "name": "ALM-OP", "members": [{"extension": "74100"}]},
+            {"action": "/api/webitel/execute", "target_extension": "74100", "target_name": "Иван"},  # before cities
+            {"action": "/api/webitel/delete_execute", "city": "almaty", "extension": "74100", "name": "Иван", "ok": False, "error": "HTTP 502"},
+            {"action": "/api/webitel/delete_execute", "city": "almaty", "extension": "74100", "name": "Иван", "crm_login": "m.muratbay"},
+        )
+        with (self.root / "audit.jsonl").open("a", encoding="utf-8") as log:
+            log.write('{"time": "2026-11-23T05:\n[]\n')
+        status, data, actions = self._card(" 74100 ")
+        actions.build_card.assert_called_once_with("74100")
+        self.assertEqual((status, data["city_name"]), (200, "Алматы"))
+        self.assertEqual([(e["kind"], e["ok"]) for e in data["history"]],
+                         [("Удаление", True), ("Удаление", False), ("Копирование", True), ("Группа", True), ("Создание", True)])
+        self.assertEqual(data["history"][0]["who"], "m.muratbay")
+        self.assertEqual([e["name"] for e in self._card("74100", "astana")[1]["history"]], ["Чужой"])
+        self.assertEqual(self._card("30555")[1]["history"], [])
+
+    def test_the_cards_history_is_not_endless(self) -> None:
+        self._write_log(*[{"action": "/api/webitel/execute", "city": "almaty", "target_extension": "30120", "target_name": str(n)} for n in range(80)])
+        history = self._card("30120")[1]["history"]
+        self.assertEqual((len(history), history[0]["name"]), (50, "79"))
+
+    def test_the_card_takes_one_number(self) -> None:
+        for extension in ("", "   ", None, "30120, 30121", "30120-30125", "иванов", "30120&x=1", "../users", "1" * 16, ["30120"]):
+            status, data, actions = self._card(extension)
+            self.assertEqual((status, data), (400, {"error": "Укажите один номер, только цифры"}), extension)
+            actions.build_card.assert_not_called()
+
+    def test_the_card_needs_a_webitel_login(self) -> None:
+        self._write_log({"action": "/api/webitel/create_execute", "city": "almaty", "new_extension": "30121", "new_name": "Иван Иванов"})
+        from crm_ai_agent.adapters.webitel_api.actions import WebitelApiError
+        from crm_ai_agent.adapters.webitel_api.session import WebitelSessionError
+
+        status, data = self._post("/api/webitel/card", {"extension": "30121", "city": "almaty"}, cookie=self._new_browser())
+        self.assertEqual((status, list(data)), (500, ["error"]))  # this browser has no Webitel session at all
+        for error in (WebitelSessionError("нет сессии"), WebitelApiError("GET /api/users failed: HTTP 401", status=401)):
+            actions = mock.Mock()
+            actions.build_card.side_effect = error
+            with mock.patch.object(server, "_get_webitel_actions", return_value=actions):
+                status, data = self._post("/api/webitel/card", {"extension": "30121"}, cookie=self._new_browser())
+            self.assertEqual((status, list(data)), (500, ["error"]))
+            self.assertIn("войдите в Webitel заново", data["error"])
+
+    def test_looking_at_a_card_is_not_written_to_the_journal(self) -> None:
+        self._card("30120")
+        self.assertFalse((self.root / "audit.jsonl").exists())
+
     def test_the_journal_needs_a_webitel_login(self) -> None:
         self._write_log({"action": "/api/webitel/create_execute", "new_extension": "30121", "new_name": "Иван Иванов"})
         for session in ("missing", "expired", "error"):
